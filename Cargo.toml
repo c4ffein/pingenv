@@ -2,7 +2,13 @@
 name = "pingenv"
 version = "0.1.0"
 edition = "2024"
+# The newest toolchain any dependency in Cargo.lock asks for. CI builds with
+# exactly this version, so the number stays true.
+rust-version = "1.95"
 license = "MIT"
+repository = "https://github.com/c4ffein/pingenv"
+keywords = ["reverse-proxy", "pingora", "acme", "static-files", "docker"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
 description = "A small reverse proxy and static file server built on Pingora, configured only by environment variables, with built-in ACME certificates"
 
 [dependencies]
@@ -11,6 +17,8 @@ async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+# Already built for Pingora, with the same backend: no extra code to compile.
+flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 http = "1"
 httpdate = "1"
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
@@ -21,6 +29,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "io-util", "macros"] }
 x509-parser = "0.18"
+
+[dev-dependencies]
+# A clock that tests can pause, for the resolver's time-outs.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

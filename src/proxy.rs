@@ -5,13 +5,17 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use log::{info, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
+use pingora::protocols::http::ServerSession;
+use pingora::proxy::FailToProxy;
+use tokio::time::Instant;
 
 use crate::acme::{CHALLENGE_PREFIX, ChallengeStore};
 use crate::config::{Config, Route, Timeouts, Upstream};
@@ -20,6 +24,11 @@ use crate::files::{self, Site};
 /// Upstream names are re-resolved this often, so a container that comes back
 /// with a new address is picked up without restarting the proxy.
 const DNS_TTL: Duration = Duration::from_secs(10);
+/// How long a request waits for a refreshed address before going ahead with
+/// the one it already has. Long enough for any healthy resolver.
+const STALE_WAIT: Duration = Duration::from_millis(500);
+/// How long the resolver gets to answer at all.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECT_RETRIES: u32 = 2;
 
 pub struct Router {
@@ -70,12 +79,37 @@ fn strip_prefix(prefix: &str, path_and_query: &str) -> String {
 }
 
 /// Lowercased, without a port or the trailing dot of a fully qualified name.
+///
+/// `None` for anything that is not a plain `host`, `host:port` or
+/// `[v6]:port`. The header is the client's to write and ends up in the access
+/// log and in `X-Forwarded-Host`, so what cannot be a host is not passed on.
 fn normalize_host(raw: &str) -> Option<String> {
-    let host = match raw.trim().strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => raw.trim().split(':').next()?,
+    let (host, port) = match raw.strip_prefix('[') {
+        Some(v6) => {
+            let (host, rest) = v6.split_once(']')?;
+            let port = match rest {
+                "" => None,
+                _ => Some(rest.strip_prefix(':')?),
+            };
+            let address = |c: char| c.is_ascii_hexdigit() || matches!(c, ':' | '.');
+            (host.chars().all(address).then_some(host)?, port)
+        }
+        None => {
+            let (host, port) = match raw.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (raw, None),
+            };
+            // Underscores are not valid in host names, but they turn up, and
+            // a name no route knows is a 404 either way.
+            let name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_');
+            (host.chars().all(name).then_some(host)?, port)
+        }
     };
-    (!host.is_empty()).then(|| host.trim_end_matches('.').to_ascii_lowercase())
+    if port.is_some_and(|p| !p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let host = host.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Host the client asked for, lowercased and without a port.
@@ -100,18 +134,22 @@ fn client_authority(req: &RequestHeader) -> Option<String> {
 
 /// A request that names two different hosts (an absolute-form target and a
 /// `Host` header, or two `Host` headers) is routed on one and would be
-/// answered on the other, so it is refused instead.
-fn ambiguous_host(req: &RequestHeader) -> bool {
-    if req.headers.get_all(http::header::HOST).iter().count() > 1 {
-        return true;
-    }
-    let header = req
-        .headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-    match (req.uri.host(), header) {
-        (Some(target), Some(header)) => normalize_host(target) != normalize_host(header),
-        _ => false,
+/// answered on the other, so it is refused instead. So is a `Host` header
+/// that is not a host at all.
+fn bad_host(req: &RequestHeader) -> Option<&'static str> {
+    let mut headers = req.headers.get_all(http::header::HOST).iter();
+    let header = match (headers.next(), headers.next()) {
+        // HTTP/2 has no `Host`, only the target; that is checked on its own.
+        (None, _) => return None,
+        (Some(only), None) => only.to_str().ok().and_then(normalize_host),
+        (Some(_), Some(_)) => return Some("ambiguous host\n"),
+    };
+    let Some(header) = header else {
+        return Some("malformed host\n");
+    };
+    match req.uri.host().map(normalize_host) {
+        Some(target) if target.as_deref() != Some(header.as_str()) => Some("ambiguous host\n"),
+        _ => None,
     }
 }
 
@@ -130,7 +168,9 @@ fn port_of(authority: &str) -> Option<u16> {
 fn decode_unreserved(path: &str) -> Option<String> {
     let hex = |b: u8| (b as char).to_digit(16);
     let bytes = path.as_bytes();
-    let mut out = String::with_capacity(path.len());
+    // Bytes, not chars: a path may hold UTF-8 that was never escaped, and it
+    // has to come out as it went in.
+    let mut out = Vec::with_capacity(bytes.len());
     let mut changed = false;
     let mut i = 0;
     while i < bytes.len() {
@@ -140,16 +180,17 @@ fn decode_unreserved(path: &str) -> Option<String> {
         {
             let byte = (high * 16 + low) as u8;
             if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
-                out.push(byte as char);
+                out.push(byte);
                 i += 3;
                 changed = true;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    changed.then_some(out)
+    // Only ASCII was swapped for ASCII, so this is still UTF-8.
+    changed.then(|| String::from_utf8(out).ok()).flatten()
 }
 
 fn normalize_request_path(session: &mut Session) -> Result<()> {
@@ -172,47 +213,159 @@ fn normalize_request_path(session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
+/// How a `host:port` is turned into addresses. A field rather than a direct
+/// call so that tests can stand in a resolver that is slow or broken.
+type Lookup =
+    Arc<dyn Fn(String) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> + Send + Sync>;
+
+fn system_lookup() -> Lookup {
+    Arc::new(|authority| {
+        Box::pin(async move { Ok(tokio::net::lookup_host(authority).await?.collect()) })
+    })
+}
+
+/// What is known about one upstream name.
+struct Known {
+    addrs: Vec<SocketAddr>,
+    /// When the resolver was last asked, whatever it answered: a resolver
+    /// that fails is asked again a TTL later, not on every request. (Tokio's
+    /// `Instant`, which is the standard one except that tests can pause it.)
+    asked: Instant,
+    /// A lookup is under way; nobody else needs to start one.
+    refreshing: bool,
+}
+
+/// Upstream names, resolved at most once per `DNS_TTL` each.
+///
+/// An address that is already known is never held hostage by the resolver:
+/// when it is due for a refresh, one request waits `STALE_WAIT` for the new
+/// answer and everyone else carries on with the old one. A resolver that is
+/// slow or down therefore costs little, as long as the upstream stays where it
+/// was. Only a name that has never resolved has to wait for its lookup.
 struct Resolver {
-    cache: Mutex<HashMap<String, (Instant, Vec<SocketAddr>)>>,
+    lookup: Lookup,
+    cache: Arc<Mutex<HashMap<String, Known>>>,
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new(system_lookup())
+    }
 }
 
 impl Resolver {
+    fn new(lookup: Lookup) -> Self {
+        Self {
+            lookup,
+            cache: Default::default(),
+        }
+    }
+
     async fn resolve(&self, upstream: &Upstream) -> Result<Vec<SocketAddr>> {
         let authority = upstream.authority();
         if let Ok(addr) = authority.parse::<SocketAddr>() {
             return Ok(vec![addr]);
         }
-        let cached = self.cache.lock().unwrap().get(&authority).cloned();
-        if let Some((at, addrs)) = &cached
-            && at.elapsed() < DNS_TTL
-        {
-            return Ok(addrs.clone());
-        }
-        let looked_up = tokio::net::lookup_host(&authority)
-            .await
-            .map(|found| found.collect::<Vec<SocketAddr>>());
-        match looked_up {
-            Ok(addrs) => {
-                if addrs.is_empty() {
-                    return Error::e_explain(ConnectNoRoute, format!("{authority}: no addresses"));
-                }
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .insert(authority, (Instant::now(), addrs.clone()));
-                Ok(addrs)
+        let known = match self.cache.lock().unwrap().get_mut(&authority) {
+            Some(known) if known.refreshing || known.asked.elapsed() < DNS_TTL => {
+                return Ok(known.addrs.clone());
             }
-            // A resolver hiccup should not take down an upstream that was
-            // reachable a moment ago.
-            Err(e) => match cached {
-                Some((_, addrs)) => {
-                    warn!("{authority}: lookup failed ({e}), using last known address");
-                    Ok(addrs)
-                }
-                None => Error::e_explain(ConnectNoRoute, format!("{authority}: {e}")),
+            Some(known) => {
+                known.refreshing = true;
+                Some(known.addrs.clone())
+            }
+            None => None,
+        };
+
+        // Its own task, so that it finishes (and records what it found) even
+        // if this request stops waiting or its client goes away.
+        let refresh = tokio::spawn(refresh(
+            self.lookup.clone(),
+            self.cache.clone(),
+            authority.clone(),
+        ));
+        match known {
+            Some(addrs) => match tokio::time::timeout(STALE_WAIT, refresh).await {
+                Ok(Ok(Ok(fresh))) => Ok(fresh),
+                // Slow or failed: `refresh` says so in the log.
+                _ => Ok(addrs),
+            },
+            None => match refresh.await {
+                Ok(Ok(addrs)) => Ok(addrs),
+                Ok(Err(why)) => Err(unresolved(&authority, why)),
+                Err(e) => Err(unresolved(&authority, e)),
             },
         }
+    }
+}
+
+/// An upstream that cannot be found is the upstream's failure, like one that
+/// cannot be reached: marked as such, it is answered with a 502, not a 500.
+fn unresolved(authority: &str, why: impl std::fmt::Display) -> Box<Error> {
+    Error::explain(ConnectNoRoute, format!("{authority}: {why}")).into_up()
+}
+
+/// Asks the resolver once and records the outcome. A failure keeps whatever
+/// address was known: a resolver hiccup should not take down an upstream that
+/// was reachable a moment ago.
+async fn refresh(
+    lookup: Lookup,
+    cache: Arc<Mutex<HashMap<String, Known>>>,
+    authority: String,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let outcome = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup(authority.clone())).await {
+        Ok(Ok(addrs)) if addrs.is_empty() => Err("no addresses".to_string()),
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "no answer from the resolver in {}s",
+            LOOKUP_TIMEOUT.as_secs()
+        )),
+    };
+    let mut cache = cache.lock().unwrap();
+    match &outcome {
+        Ok(addrs) => {
+            let known = Known {
+                addrs: addrs.clone(),
+                asked: Instant::now(),
+                refreshing: false,
+            };
+            cache.insert(authority, known);
+        }
+        Err(why) => {
+            if let Some(known) = cache.get_mut(&authority) {
+                warn!("{authority}: lookup failed ({why}), keeping the last known address");
+                known.asked = Instant::now();
+                known.refreshing = false;
+            }
+        }
+    }
+    outcome
+}
+
+/// The requests being served right now. Shutdown reads it to stop waiting
+/// once there are none left.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn enter(&self) -> Entered {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        Entered(self.0.clone())
+    }
+}
+
+/// One request's share of the count, given back when it is dropped: however
+/// the request ends, it cannot be left counted.
+struct Entered(Arc<AtomicUsize>);
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -227,11 +380,18 @@ pub struct Gateway {
     https_redirect_port: u16,
     timeouts: Timeouts,
     hsts: Option<String>,
+    in_flight: InFlight,
 }
 
 impl Gateway {
-    pub fn new(config: &Config, sites: Vec<Option<Site>>, challenges: Arc<ChallengeStore>) -> Self {
+    pub fn new(
+        config: &Config,
+        sites: Vec<Option<Site>>,
+        challenges: Arc<ChallengeStore>,
+        in_flight: InFlight,
+    ) -> Self {
         Self {
+            in_flight,
             sites,
             counters: config.routes.iter().map(|_| AtomicUsize::new(0)).collect(),
             router: Router::new(config.routes.clone()),
@@ -254,23 +414,32 @@ pub struct RequestCtx {
     upstream: Option<String>,
     connect_failures: u32,
     started: Option<Instant>,
+    /// Held, not read: the request is counted for as long as this lives.
+    _in_flight: Option<Entered>,
 }
 
 fn is_tls(session: &Session) -> bool {
     session.digest().is_some_and(|d| d.ssl_digest.is_some())
 }
 
+/// A response written here rather than by an upstream: an error, a redirect.
+/// `hsts` is the `Strict-Transport-Security` value to send with it, which the
+/// caller has only for requests that came over HTTPS.
 pub(crate) async fn respond(
     session: &mut Session,
     status: u16,
     headers: &[(&'static str, String)],
     body: &'static str,
+    hsts: Option<&str>,
 ) -> Result<()> {
-    let mut resp = ResponseHeader::build(status, Some(headers.len() + 2))?;
+    let mut resp = ResponseHeader::build(status, Some(headers.len() + 3))?;
     resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
     resp.insert_header("Content-Length", body.len().to_string())?;
     for (name, value) in headers {
         resp.insert_header(*name, value)?;
+    }
+    if let Some(value) = hsts {
+        resp.insert_header("Strict-Transport-Security", value)?;
     }
     session
         .write_response_header(Box::new(resp), body.is_empty())
@@ -288,7 +457,10 @@ impl ProxyHttp for Gateway {
     type CTX = RequestCtx;
 
     fn new_ctx(&self) -> RequestCtx {
-        RequestCtx::default()
+        RequestCtx {
+            _in_flight: Some(self.in_flight.enter()),
+            ..Default::default()
+        }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut RequestCtx) -> Result<bool> {
@@ -296,12 +468,13 @@ impl ProxyHttp for Gateway {
         // The client has to keep reading the response too.
         session.set_write_timeout(self.timeouts.write);
         let tls = is_tls(session);
+        let hsts = self.hsts.as_deref().filter(|_| tls);
         normalize_request_path(session)?;
         let req = session.req_header();
         let path = req.uri.path().to_string();
 
-        if ambiguous_host(req) {
-            respond(session, 400, &[], "ambiguous host\n").await?;
+        if let Some(why) = bad_host(req) {
+            respond(session, 400, &[], why, hsts).await?;
             return Ok(true);
         }
 
@@ -326,13 +499,13 @@ impl ProxyHttp for Gateway {
         }
 
         let Some(host) = request_host(req) else {
-            respond(session, 400, &[], "missing host\n").await?;
+            respond(session, 400, &[], "missing host\n", hsts).await?;
             return Ok(true);
         };
         ctx.forwarded_host = client_authority(req).unwrap_or_else(|| host.clone());
         let Some(route) = self.router.find(&host, &path) else {
             ctx.host = host;
-            respond(session, 404, &[], "no route for this host\n").await?;
+            respond(session, 404, &[], "no route for this host\n", hsts).await?;
             return Ok(true);
         };
         ctx.route = Some(route);
@@ -342,7 +515,7 @@ impl ProxyHttp for Gateway {
         let passthrough = challenge.is_some() && self.router.routes[route].acme_passthrough;
         if challenge.is_some() && !passthrough {
             ctx.host = host;
-            respond(session, 404, &[], "unknown challenge\n").await?;
+            respond(session, 404, &[], "unknown challenge\n", hsts).await?;
             return Ok(true);
         }
 
@@ -353,14 +526,13 @@ impl ProxyHttp for Gateway {
                 port => format!("https://{host}:{port}{target}"),
             };
             ctx.host = host;
-            respond(session, 308, &[("Location", location)], "").await?;
+            respond(session, 308, &[("Location", location)], "", hsts).await?;
             return Ok(true);
         }
         ctx.host = host;
 
         if let Some(site) = &self.sites[route] {
             let prefix = &self.router.routes[route].path;
-            let hsts = self.hsts.as_deref().filter(|_| tls);
             let source = files::serve(site, session, prefix, hsts).await?;
             ctx.upstream = Some(source.to_string());
             return Ok(true);
@@ -378,10 +550,11 @@ impl ProxyHttp for Gateway {
         // Round robin across upstreams; a retry lands on the next one.
         let turn = self.counters[index].fetch_add(1, Ordering::Relaxed);
         let upstream = &route.upstreams[turn % route.upstreams.len()];
+        // Before resolving, so the access log names it even if that fails.
+        ctx.upstream = Some(upstream.authority());
         let addrs = self.resolver.resolve(upstream).await?;
         let addr = addrs[turn / route.upstreams.len() % addrs.len()];
 
-        ctx.upstream = Some(upstream.authority());
         let mut peer = HttpPeer::new(addr, upstream.tls, upstream.host.clone());
         peer.options.connection_timeout = self.timeouts.upstream_connect;
         peer.options.read_timeout = route.read_timeout.unwrap_or(self.timeouts.upstream_read);
@@ -455,6 +628,43 @@ impl ProxyHttp for Gateway {
             upstream_response.insert_header("Strict-Transport-Security", value)?;
         }
         Ok(())
+    }
+
+    /// The response for a request that failed on the way: an upstream that
+    /// is down or too slow, mostly. The status is chosen as Pingora chooses
+    /// it by default; the difference is that the response carries the same
+    /// `Strict-Transport-Security` as every other one.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut RequestCtx,
+    ) -> FailToProxy {
+        let code = match (e.etype(), e.esource()) {
+            (HTTPStatus(code), _) => *code,
+            (_, ErrorSource::Upstream) => 502,
+            // The client is gone: nobody to answer.
+            (WriteError | ReadError | ConnectionClosed, ErrorSource::Downstream) => 0,
+            (_, ErrorSource::Downstream) => 400,
+            (_, ErrorSource::Internal | ErrorSource::Unset) => 500,
+        };
+        if code > 0 {
+            let mut resp = ServerSession::generate_error(code);
+            if let Some(value) = self.hsts.as_deref().filter(|_| is_tls(session)) {
+                // The value was checked when the configuration was read.
+                let _ = resp.insert_header("Strict-Transport-Security", value);
+            }
+            let written = session
+                .as_downstream_mut()
+                .write_error_response(resp, Bytes::new());
+            if let Err(e) = written.await {
+                warn!("could not send the {code} response: {e}");
+            }
+        }
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
     }
 
     fn fail_to_connect(
@@ -577,6 +787,62 @@ mod tests {
         assert_eq!(request_host(&req).as_deref(), Some("example.com"));
         req.insert_header("Host", "[::1]:80").unwrap();
         assert_eq!(request_host(&req).as_deref(), Some("::1"));
+
+        assert_eq!(
+            normalize_host("my_app.test").as_deref(),
+            Some("my_app.test")
+        );
+        assert_eq!(normalize_host("a.test:").as_deref(), Some("a.test"));
+        assert_eq!(normalize_host("[fe80::1]").as_deref(), Some("fe80::1"));
+    }
+
+    #[test]
+    fn what_cannot_be_a_host_is_not_one() {
+        for bad in [
+            "",
+            ".",
+            ":80",
+            "a.test:80x",
+            "a.test:80:80",
+            // Spaces would let a client write its own access log fields.
+            "a.test 200 route=admin",
+            "a.test/admin",
+            "a.test\tx",
+            "user@a.test",
+            "caf\u{e9}.test",
+            "[::1",
+            "[::1]x",
+            "[::1]:x",
+            "[a.test]",
+            "[]",
+        ] {
+            assert_eq!(normalize_host(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_naming_two_hosts_or_no_real_host_is_refused() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        assert_eq!(bad_host(&req), None);
+        req.insert_header("Host", "app.test:8443").unwrap();
+        assert_eq!(bad_host(&req), None);
+        req.insert_header("Host", "app.test 200 route=admin")
+            .unwrap();
+        assert_eq!(bad_host(&req), Some("malformed host\n"));
+
+        // HTTP/2 carries the authority in the URI (`:authority`).
+        let mut absolute = RequestHeader::build("GET", b"/x", None).unwrap();
+        absolute.set_uri("http://app.test/x".parse().unwrap());
+        assert_eq!(bad_host(&absolute), None);
+        absolute.insert_header("Host", "App.test").unwrap();
+        assert_eq!(bad_host(&absolute), None);
+        absolute.insert_header("Host", "admin.internal").unwrap();
+        assert_eq!(bad_host(&absolute), Some("ambiguous host\n"));
+
+        let mut twice = RequestHeader::build("GET", b"/", None).unwrap();
+        twice.append_header("Host", "a.test").unwrap();
+        twice.append_header("Host", "a.test").unwrap();
+        assert_eq!(bad_host(&twice), Some("ambiguous host\n"));
     }
 
     #[test]
@@ -590,27 +856,27 @@ mod tests {
         assert_eq!(decode_unreserved("/a%20b"), None);
         assert_eq!(decode_unreserved("/%zz%6"), None);
         assert_eq!(decode_unreserved("/%61%").as_deref(), Some("/a%"));
+        // Neither is UTF-8 that was sent as it is, escaped or not.
+        assert_eq!(decode_unreserved("/caf\u{e9}/\u{65e5}\u{672c}"), None);
+        assert_eq!(
+            decode_unreserved("/%61/caf\u{e9}/\u{65e5}\u{672c}/%7E").as_deref(),
+            Some("/a/caf\u{e9}/\u{65e5}\u{672c}/~")
+        );
+        assert_eq!(
+            decode_unreserved("/%61/caf%C3%A9").as_deref(),
+            Some("/a/caf%C3%A9")
+        );
     }
 
     #[test]
-    fn a_request_naming_two_hosts_is_ambiguous() {
-        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
-        assert!(!ambiguous_host(&req));
-        req.insert_header("Host", "app.test:8443").unwrap();
-        assert!(!ambiguous_host(&req));
-
-        // HTTP/2 carries the authority in the URI (`:authority`).
-        let mut absolute = RequestHeader::build("GET", b"/x", None).unwrap();
-        absolute.set_uri("http://app.test/x".parse().unwrap());
-        absolute.insert_header("Host", "App.test").unwrap();
-        assert!(!ambiguous_host(&absolute));
-        absolute.insert_header("Host", "admin.internal").unwrap();
-        assert!(ambiguous_host(&absolute));
-
-        let mut twice = RequestHeader::build("GET", b"/", None).unwrap();
-        twice.append_header("Host", "a.test").unwrap();
-        twice.append_header("Host", "a.test").unwrap();
-        assert!(ambiguous_host(&twice));
+    fn requests_are_counted_while_they_are_served() {
+        let in_flight = InFlight::default();
+        let (first, second) = (in_flight.enter(), in_flight.enter());
+        assert_eq!(in_flight.count(), 2);
+        drop(first);
+        assert_eq!(in_flight.count(), 1);
+        drop(second);
+        assert_eq!(in_flight.count(), 0);
     }
 
     #[test]
@@ -627,6 +893,152 @@ mod tests {
             client_authority(&RequestHeader::build("GET", b"/", None).unwrap()),
             None
         );
+    }
+
+    const A: &str = "10.0.0.1:80";
+    const B: &str = "10.0.0.2:80";
+
+    fn named(host: &str) -> Upstream {
+        Upstream {
+            host: host.into(),
+            port: 80,
+            tls: false,
+        }
+    }
+
+    type Answer = (Duration, std::result::Result<&'static str, &'static str>);
+
+    /// A resolver whose n-th lookup takes `script(n).0` and then gives
+    /// `script(n).1`, plus the number of lookups made so far.
+    fn scripted(
+        script: impl Fn(usize) -> Answer + Send + Sync + 'static,
+    ) -> (Resolver, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let lookup: Lookup = Arc::new(move |_authority| {
+            let (delay, answer) = script(counter.fetch_add(1, Ordering::SeqCst));
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                answer
+                    .map(|addr| vec![addr.parse().unwrap()])
+                    .map_err(std::io::Error::other)
+            })
+        });
+        (Resolver::new(lookup), calls)
+    }
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    const INSTANT: Duration = Duration::ZERO;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_resolver_does_not_stall_a_known_upstream() {
+        let (resolver, _) = scripted(|n| match n {
+            0 => (INSTANT, Ok(A)),
+            _ => (Duration::from_secs(3), Ok(B)),
+        });
+        assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[A]));
+
+        tokio::time::sleep(DNS_TTL + Duration::from_secs(1)).await;
+        let asked = Instant::now();
+        let got = resolver.resolve(&named("app")).await.unwrap();
+        assert!(
+            asked.elapsed() <= Duration::from_secs(1),
+            "waited {:?} for an address that was already known",
+            asked.elapsed()
+        );
+        assert_eq!(got, addrs(&[A]));
+
+        // The slow answer is not thrown away: once it lands it is used.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[B]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_never_answers_is_given_up_on() {
+        let (resolver, calls) = scripted(|n| match n {
+            0 => (INSTANT, Ok(A)),
+            _ => (Duration::from_secs(3600), Ok(B)),
+        });
+        resolver.resolve(&named("app")).await.unwrap();
+        tokio::time::sleep(DNS_TTL + Duration::from_secs(1)).await;
+        assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[A]));
+
+        // The stuck lookup does not block later ones for ever.
+        tokio::time::sleep(LOOKUP_TIMEOUT + DNS_TTL + Duration::from_secs(1)).await;
+        assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[A]));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_arriving_together_share_one_lookup() {
+        let (resolver, calls) = scripted(|n| match n {
+            0 => (INSTANT, Ok(A)),
+            _ => (Duration::from_millis(50), Ok(B)),
+        });
+        resolver.resolve(&named("app")).await.unwrap();
+        tokio::time::sleep(DNS_TTL + Duration::from_secs(1)).await;
+
+        let upstream = named("app");
+        let together = (0..50).map(|_| resolver.resolve(&upstream));
+        for result in futures_util::future::join_all(together).await {
+            result.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one to start, one refresh");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_resolver_is_asked_once_per_ttl_not_once_per_request() {
+        let (resolver, calls) = scripted(|n| match n {
+            0 => (INSTANT, Ok(A)),
+            _ => (INSTANT, Err("servfail")),
+        });
+        resolver.resolve(&named("app")).await.unwrap();
+        tokio::time::sleep(DNS_TTL + Duration::from_secs(1)).await;
+
+        for _ in 0..10 {
+            // The last known address keeps the upstream reachable.
+            assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[A]));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        tokio::time::sleep(DNS_TTL + Duration::from_secs(1)).await;
+        resolver.resolve(&named("app")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "asked again a TTL later");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_upstream_waits_for_its_first_lookup_but_not_forever() {
+        let (resolver, _) = scripted(|_| (Duration::from_millis(200), Ok(A)));
+        assert_eq!(resolver.resolve(&named("app")).await.unwrap(), addrs(&[A]));
+
+        let (resolver, _) = scripted(|_| (Duration::from_secs(3600), Ok(A)));
+        let asked = Instant::now();
+        assert!(resolver.resolve(&named("app")).await.is_err());
+        assert!(asked.elapsed() <= Duration::from_secs(10), "gave up late");
+
+        let (resolver, _) = scripted(|_| (INSTANT, Err("nxdomain")));
+        let error = resolver.resolve(&named("app")).await.unwrap_err();
+        // The upstream's failure, so a 502 for the client and not a 500.
+        assert_eq!(error.esource(), &ErrorSource::Upstream);
+        assert!(error.to_string().contains("app:80: nxdomain"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn addresses_are_not_looked_up() {
+        let (resolver, calls) = scripted(|_| (INSTANT, Err("unused")));
+        let literal = Upstream {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            tls: false,
+        };
+        assert_eq!(
+            resolver.resolve(&literal).await.unwrap(),
+            addrs(&["127.0.0.1:8080"])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the Dockerfile builds with. Keep the two in step.
+  RUST_VERSION: "1.99.0"
+  # Let's Encrypt's ACME test server, for the certificate part of the
+  # end-to-end test.
+  PEBBLE_VERSION: v2.10.3
+
+jobs:
+  test:
+    name: Lint, unit tests, end-to-end tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Build Pebble
+        run: |
+          git clone --depth 1 --branch "$PEBBLE_VERSION" https://github.com/letsencrypt/pebble "$RUNNER_TEMP/pebble"
+          cd "$RUNNER_TEMP/pebble"
+          go build -o pebble-bin ./cmd/pebble
+          go build -o challtestsrv-bin ./cmd/pebble-challtestsrv
+      # The real binary against local upstreams and a real ACME issuance.
+      - run: tests/e2e.sh --acme "$RUNNER_TEMP/pebble"
+
+  msrv:
+    name: Builds with the declared rust-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  image:
+    name: Container image builds and starts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: pingenv:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Nothing in the tests above runs the image itself: that it starts as an
+      # unprivileged user, binds port 80, serves a file and passes its own
+      # health check is only known from here.
+      - name: Smoke test
+        run: |
+          docker run -d --name pingenv -p 8080:80 -v "$PWD/tests:/srv/site:ro" \
+            -e PINGENV_ROUTE_SITE_HOST=localhost -e PINGENV_ROUTE_SITE_ROOT=/srv/site \
+            pingenv:ci
+          curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused \
+            --output /dev/null http://localhost:8080/e2e.sh
+          docker exec pingenv /pingenv --healthcheck
+      - name: Container log
+        if: always()
+        run: docker logs pingenv || true

@@ -9,17 +9,19 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use log::{error, info};
 use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
-use pingora::server::Server;
 use pingora::server::configuration::ServerConf;
-use pingora::services::background::background_service;
+use pingora::server::{Server, ShutdownWatch};
+use pingora::services::background::{BackgroundService, background_service};
 
 use crate::acme::{AcmeService, ChallengeStore};
 use crate::certs::{BoxError, CertReloader, CertStore};
-use crate::config::{Config, TlsMode};
+use crate::config::{CertFiles, Config, TlsMode};
 use crate::files::{MemoryBudget, Site};
+use crate::proxy::InFlight;
 
 fn main() -> ExitCode {
     let vars = std::env::vars_os()
@@ -73,30 +75,64 @@ fn healthcheck(config: &Config) -> ExitCode {
     }
 }
 
+/// Ends a shutdown as soon as there is nothing left to wait for.
+///
+/// On `SIGTERM` Pingora closes the listeners, lets requests in flight carry
+/// on, and then sleeps for the whole grace period whether or not anything is
+/// still running. With nothing running that is only downtime: the container
+/// replacing this one cannot have the ports until the process is gone. The
+/// grace period stays the upper bound; this just stops waiting when the last
+/// request is done.
+struct Drain {
+    in_flight: InFlight,
+}
+
+#[async_trait]
+impl BackgroundService for Drain {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+        // Two looks in a row, so that a request which had arrived but was not
+        // yet being served when the signal came is not missed.
+        let mut quiet = 0;
+        while quiet < 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            quiet = if self.in_flight.count() == 0 {
+                quiet + 1
+            } else {
+                0
+            };
+        }
+        info!("no requests in flight, exiting");
+        // What Pingora itself does once the grace period is over.
+        std::process::exit(0);
+    }
+}
+
 fn run(config: Config) -> Result<(), BoxError> {
     let store = Arc::new(CertStore::new());
     let challenges = Arc::new(ChallengeStore::default());
 
+    // Certificates are per host: files named on one route serve that host on
+    // all of them, and each pair of files is loaded and watched once.
     let reloader = CertReloader::new(store.clone(), config.cert_reload_interval);
-    for route in &config.routes {
-        let key = match (&route.cert_files, config.tls) {
-            (Some(files), _) => {
-                reloader.watch(route.hosts.clone(), files.cert.clone(), files.key.clone());
-                Some(Arc::new(certs::certified_key_from_files(
-                    &files.cert,
-                    &files.key,
-                )?))
-            }
-            (None, TlsMode::SelfSigned) => None,
-            _ => continue,
-        };
-        for host in &route.hosts {
-            let key = match &key {
-                Some(key) => key.clone(),
-                None => Arc::new(certs::self_signed(host)?),
-            };
-            store.set(host, key);
+    let mut by_files: Vec<(&CertFiles, Vec<String>)> = Vec::new();
+    for (host, files) in config.cert_files() {
+        match by_files.iter_mut().find(|(known, _)| *known == files) {
+            Some((_, hosts)) => hosts.push(host.to_string()),
+            None => by_files.push((files, vec![host.to_string()])),
         }
+    }
+    for (files, hosts) in by_files {
+        let key = Arc::new(certs::certified_key_from_files(&files.cert, &files.key)?);
+        for host in &hosts {
+            store.set(host, key.clone());
+        }
+        reloader.watch(hosts, files.cert.clone(), files.key.clone());
+    }
+    for host in config.self_signed_hosts() {
+        store.set(&host, Arc::new(certs::self_signed(&host)?));
     }
 
     let budget = MemoryBudget::new(config.memory_max_total);
@@ -134,9 +170,10 @@ fn run(config: Config) -> Result<(), BoxError> {
     let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();
 
+    let in_flight = InFlight::default();
     let mut service = http_proxy_service(
         &server.configuration,
-        proxy::Gateway::new(&config, sites, challenges),
+        proxy::Gateway::new(&config, sites, challenges, in_flight.clone()),
     );
     service.add_tcp(&config.http_addr.to_string());
     info!("listening for HTTP on {}", config.http_addr);
@@ -167,6 +204,7 @@ fn run(config: Config) -> Result<(), BoxError> {
     }
 
     server.add_service(service);
+    server.add_service(background_service("drain", Drain { in_flight }));
     if let Some(acme) = acme {
         server.add_service(background_service("acme", acme));
     }

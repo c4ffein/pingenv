@@ -65,6 +65,10 @@ pub struct StaticSite {
     /// Served for paths that match no file, for single-page applications.
     pub fallback: Option<String>,
     pub cache_control: String,
+    /// Send text compressed to clients that accept it: a gzip copy of files
+    /// held in memory, and precompressed `.br` / `.gz` copies found next to
+    /// a file.
+    pub compress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +158,19 @@ const GLOBALS: &[&str] = &[
     "LOG_LEVEL",
 ];
 
+/// Globals that only mean something with a TLS mode. `HSTS` and
+/// `HTTPS_REDIRECT` are in the same position and have their own messages.
+const TLS_ONLY: &[&str] = &[
+    "HTTPS_ADDR",
+    "HTTPS_REDIRECT_PORT",
+    "DATA_DIR",
+    "ACME_EMAIL",
+    "ACME_STAGING",
+    "ACME_DIRECTORY_URL",
+    "ACME_CA_FILE",
+    "CERT_RELOAD_INTERVAL",
+];
+
 const ROUTE_FIELDS: &[&str] = &[
     "MEMORY_MAX_FILE",
     "MEMORY_PATHS",
@@ -161,6 +178,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "ACME_PASSTHROUGH",
     "READ_TIMEOUT",
     "CACHE_CONTROL",
+    "COMPRESS",
     "TLS_CERT_FILE",
     "TLS_KEY_FILE",
     "STRIP_PREFIX",
@@ -225,6 +243,7 @@ impl Config {
 
         let get = |k: &str| globals.get(k).filter(|v| !v.is_empty()).cloned();
 
+        let mut tls_mode_understood = true;
         let tls = match get("TLS_MODE")
             .as_deref()
             .map(str::to_ascii_lowercase)
@@ -238,6 +257,7 @@ impl Config {
                 errors.push(format!(
                     "PINGENV_TLS_MODE: '{other}' is not one of off, acme, selfsigned, manual"
                 ));
+                tls_mode_understood = false;
                 TlsMode::Off
             }
         };
@@ -295,6 +315,19 @@ impl Config {
             None if staging => LETS_ENCRYPT_STAGING.to_string(),
             None => LETS_ENCRYPT_PRODUCTION.to_string(),
         };
+        // With TLS off these would be read and then do nothing, which is how
+        // a forgotten PINGENV_TLS_MODE=acme becomes a plain HTTP server. (If
+        // the mode itself is wrong, that one error says enough.)
+        if tls == TlsMode::Off && tls_mode_understood {
+            let set = TLS_ONLY.iter().filter(|key| get(key).is_some());
+            // `false` spells out the default, which is not a mistake.
+            for key in set.filter(|key| **key != "ACME_STAGING" || staging) {
+                errors.push(format!(
+                    "PINGENV_{key}: does nothing while PINGENV_TLS_MODE is off (the default); \
+                     set PINGENV_TLS_MODE to acme, selfsigned or manual, or remove it"
+                ));
+            }
+        }
         let email = get("ACME_EMAIL");
         if let Some(e) = &email
             && (!e.contains('@') || e.contains(char::is_whitespace))
@@ -395,6 +428,7 @@ impl Config {
         }
 
         let mut seen = HashSet::new();
+        let certified = cert_files_by_host(&routes);
         for route in &routes {
             for host in &route.hosts {
                 if !seen.insert((host.clone(), route.path.clone())) {
@@ -406,26 +440,35 @@ impl Config {
                 }
             }
             let var = |f: &str| format!("PINGENV_ROUTE_{}_{f}", route.name.to_uppercase());
-            match (tls, &route.cert_files) {
-                (TlsMode::Off, Some(_)) => errors.push(format!(
+            if tls == TlsMode::Off && route.cert_files.is_some() {
+                errors.push(format!(
                     "{}: certificate files are set but PINGENV_TLS_MODE is off",
                     var("TLS_CERT_FILE")
-                )),
-                (TlsMode::Manual, None) => errors.push(format!(
-                    "{} and {}: required when PINGENV_TLS_MODE is manual",
-                    var("TLS_CERT_FILE"),
-                    var("TLS_KEY_FILE")
-                )),
-                (TlsMode::Acme, None) => {
-                    for host in route.hosts.iter().filter(|h| h.starts_with("*.")) {
-                        errors.push(format!(
-                            "{}: {host} is a wildcard, which HTTP-01 cannot validate; \
-                             give this route certificate files instead",
-                            var("HOST")
-                        ));
-                    }
+                ));
+            }
+            for host in &route.hosts {
+                match (certified.get(host.as_str()), &route.cert_files, tls) {
+                    // One host cannot present two certificates.
+                    (Some(first), Some(_), _) if first.cert_files != route.cert_files => errors
+                        .push(format!(
+                            "{}: {host} already has a different certificate, from \
+                             PINGENV_ROUTE_{}_TLS_CERT_FILE; a host has one certificate, \
+                             whichever of its routes names it",
+                            var("TLS_CERT_FILE"),
+                            first.name.to_uppercase()
+                        )),
+                    (None, _, TlsMode::Manual) => errors.push(format!(
+                        "{}: {host} has no certificate; PINGENV_TLS_MODE is manual, so one \
+                         of its routes must set TLS_CERT_FILE and TLS_KEY_FILE",
+                        var("HOST")
+                    )),
+                    (None, _, TlsMode::Acme) if host.starts_with("*.") => errors.push(format!(
+                        "{}: {host} is a wildcard, which HTTP-01 cannot validate; \
+                         give this route certificate files instead",
+                        var("HOST")
+                    )),
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -458,21 +501,58 @@ impl Config {
         })
     }
 
-    /// Hosts whose certificates are obtained from the ACME CA.
-    pub fn acme_hosts(&self) -> Vec<String> {
-        if self.tls != TlsMode::Acme {
-            return Vec::new();
-        }
-        let mut hosts: Vec<String> = self
-            .routes
-            .iter()
-            .filter(|r| r.cert_files.is_none())
-            .flat_map(|r| r.hosts.iter().cloned())
+    /// The certificate and key files of every host that was given some.
+    ///
+    /// A certificate belongs to a host, not to a route: files named on one
+    /// route cover its hosts wherever else they are routed.
+    pub fn cert_files(&self) -> BTreeMap<&str, &CertFiles> {
+        cert_files_by_host(&self.routes)
+            .into_iter()
+            .filter_map(|(host, route)| Some((host, route.cert_files.as_ref()?)))
+            .collect()
+    }
+
+    /// Hosts that no route gave certificate files, sorted.
+    fn hosts_without_cert_files(&self) -> Vec<String> {
+        let certified = self.cert_files();
+        let hosts = self.routes.iter().flat_map(|r| &r.hosts);
+        let mut hosts: Vec<String> = hosts
+            .filter(|host| !certified.contains_key(host.as_str()))
+            .cloned()
             .collect();
         hosts.sort();
         hosts.dedup();
         hosts
     }
+
+    /// Hosts whose certificates are obtained from the ACME CA.
+    pub fn acme_hosts(&self) -> Vec<String> {
+        match self.tls {
+            TlsMode::Acme => self.hosts_without_cert_files(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Hosts that get a certificate generated at startup.
+    pub fn self_signed_hosts(&self) -> Vec<String> {
+        match self.tls {
+            TlsMode::SelfSigned => self.hosts_without_cert_files(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// For each host with certificate files, the route that names them. If two
+/// routes name different files for one host the first is kept here, and
+/// `Config::from_env` reports the second.
+fn cert_files_by_host(routes: &[Route]) -> BTreeMap<&str, &Route> {
+    let mut by_host = BTreeMap::new();
+    for route in routes.iter().filter(|r| r.cert_files.is_some()) {
+        for host in &route.hosts {
+            by_host.entry(host.as_str()).or_insert(route);
+        }
+    }
+    by_host
 }
 
 fn parse_route(
@@ -648,6 +728,7 @@ fn parse_route(
             {
                 errors.push(format!("{}: must be printable ASCII", var("CACHE_CONTROL")));
             }
+            let compress = parse_bool(errors, &var("COMPRESS"), field("COMPRESS").cloned(), true);
             Some(StaticSite {
                 root: PathBuf::from(root),
                 memory_max_file,
@@ -655,6 +736,7 @@ fn parse_route(
                 memory_refresh,
                 fallback,
                 cache_control,
+                compress,
             })
         }
         None => {
@@ -664,6 +746,7 @@ fn parse_route(
                 "MEMORY_PATHS",
                 "MEMORY_REFRESH",
                 "CACHE_CONTROL",
+                "COMPRESS",
             ] {
                 if field(files_only).is_some() {
                     errors.push(format!(
@@ -1005,6 +1088,77 @@ mod tests {
     }
 
     #[test]
+    fn a_certificate_named_on_one_route_covers_its_hosts_on_every_route() {
+        // Two routes share example.com; only one of them names the files.
+        let shared = [
+            ("PINGENV_ROUTE_API_HOST", "example.com,api.example.com"),
+            ("PINGENV_ROUTE_API_PATH", "/api"),
+            ("PINGENV_ROUTE_API_UPSTREAM", "api:1"),
+            ("PINGENV_ROUTE_SITE_HOST", "example.com"),
+            ("PINGENV_ROUTE_SITE_UPSTREAM", "site:1"),
+            ("PINGENV_ROUTE_SITE_TLS_CERT_FILE", "/c.pem"),
+            ("PINGENV_ROUTE_SITE_TLS_KEY_FILE", "/k.pem"),
+        ];
+        let with_mode = |mode: &'static str| {
+            let mut vars = shared.to_vec();
+            vars.push(("PINGENV_TLS_MODE", mode));
+            env(&vars)
+        };
+
+        let acme = with_mode("acme").unwrap();
+        let files = acme.cert_files();
+        assert_eq!(files.keys().copied().collect::<Vec<_>>(), ["example.com"]);
+        assert_eq!(files["example.com"].cert, PathBuf::from("/c.pem"));
+        // example.com has its files, so only the other host is asked for.
+        assert_eq!(acme.acme_hosts(), ["api.example.com"]);
+        assert!(acme.self_signed_hosts().is_empty());
+
+        let self_signed = with_mode("selfsigned").unwrap();
+        assert_eq!(self_signed.self_signed_hosts(), ["api.example.com"]);
+        assert!(self_signed.acme_hosts().is_empty());
+
+        // In manual mode it is the host that needs files, not every route.
+        let errs = with_mode("manual").unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].starts_with("PINGENV_ROUTE_API_HOST: api.example.com has no certificate"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn one_host_cannot_be_given_two_certificates() {
+        let mut vars = vec![
+            ("PINGENV_TLS_MODE", "manual"),
+            ("PINGENV_ROUTE_A_HOST", "example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_ROUTE_A_TLS_CERT_FILE", "/a.pem"),
+            ("PINGENV_ROUTE_A_TLS_KEY_FILE", "/a.key"),
+            ("PINGENV_ROUTE_B_HOST", "example.com"),
+            ("PINGENV_ROUTE_B_PATH", "/b"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_TLS_CERT_FILE", "/b.pem"),
+            ("PINGENV_ROUTE_B_TLS_KEY_FILE", "/b.key"),
+        ];
+        let errs = env(&vars).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].starts_with("PINGENV_ROUTE_B_TLS_CERT_FILE: example.com already has"),
+            "{errs:?}"
+        );
+        assert!(
+            errs[0].contains("PINGENV_ROUTE_A_TLS_CERT_FILE"),
+            "{errs:?}"
+        );
+
+        // Naming the same files twice is redundant, not a conflict.
+        vars.retain(|(key, _)| !key.starts_with("PINGENV_ROUTE_B_TLS"));
+        vars.push(("PINGENV_ROUTE_B_TLS_CERT_FILE", "/a.pem"));
+        vars.push(("PINGENV_ROUTE_B_TLS_KEY_FILE", "/a.key"));
+        assert_eq!(env(&vars).unwrap().cert_files().len(), 1);
+    }
+
+    #[test]
     fn redirect_without_tls_is_an_error() {
         let errs = env(&[
             ("PINGENV_HTTPS_REDIRECT", "true"),
@@ -1013,6 +1167,52 @@ mod tests {
         ])
         .unwrap_err();
         assert!(errs[0].contains("HTTPS_REDIRECT"), "{errs:?}");
+    }
+
+    #[test]
+    fn tls_settings_without_a_tls_mode_are_errors() {
+        // The likely mistake: everything for ACME is there except the mode,
+        // which defaults to off. That must not start a plain HTTP server.
+        let route = [
+            ("PINGENV_ROUTE_A_HOST", "example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+        ];
+        for (key, value) in [
+            ("PINGENV_ACME_EMAIL", "ops@example.com"),
+            ("PINGENV_ACME_STAGING", "true"),
+            (
+                "PINGENV_ACME_DIRECTORY_URL",
+                "https://ca.example.com/directory",
+            ),
+            ("PINGENV_ACME_CA_FILE", "/ca.pem"),
+            ("PINGENV_HTTPS_ADDR", "0.0.0.0:8443"),
+            ("PINGENV_HTTPS_REDIRECT_PORT", "8443"),
+            ("PINGENV_DATA_DIR", "/var/lib/pingenv"),
+            ("PINGENV_CERT_RELOAD_INTERVAL", "30s"),
+        ] {
+            let mut vars = route.to_vec();
+            vars.push((key, value));
+            let errs = env(&vars).expect_err(key);
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert!(errs[0].starts_with(&format!("{key}: ")), "{errs:?}");
+            assert!(errs[0].contains("PINGENV_TLS_MODE is off"), "{errs:?}");
+
+            // The same setting is fine once a mode is chosen.
+            vars.push(("PINGENV_TLS_MODE", "selfsigned"));
+            assert!(env(&vars).is_ok(), "{key} with a TLS mode");
+        }
+
+        // Spelling out a default changes nothing, so it is not a mistake.
+        let mut vars = route.to_vec();
+        vars.push(("PINGENV_ACME_STAGING", "false"));
+        vars.push(("PINGENV_HTTPS_REDIRECT", "false"));
+        assert!(env(&vars).is_ok());
+
+        // A mode that is set but wrong is one problem, not one per setting.
+        let mut vars = route.to_vec();
+        vars.push(("PINGENV_TLS_MODE", "letsencrypt"));
+        vars.push(("PINGENV_ACME_EMAIL", "ops@example.com"));
+        assert_eq!(env(&vars).unwrap_err().len(), 1);
     }
 
     #[test]
@@ -1050,6 +1250,7 @@ mod tests {
                 memory_refresh: Some(Duration::from_secs(300)),
                 fallback: Some("/index.html".into()),
                 cache_control: "no-cache".into(),
+                compress: true,
             })
         );
         assert_eq!(cfg.memory_max_total, 10_000_000);
@@ -1083,6 +1284,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(never.routes[0].site.as_ref().unwrap().memory_refresh, None);
+
+        let plain = env(&[
+            ("PINGENV_ROUTE_SITE_HOST", "example.com"),
+            ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_SITE_COMPRESS", "false"),
+        ])
+        .unwrap();
+        assert!(!plain.routes[0].site.as_ref().unwrap().compress);
 
         let errs = env(&[
             ("PINGENV_ROUTE_SITE_HOST", "example.com"),
@@ -1186,6 +1395,7 @@ mod tests {
             ("PINGENV_ROUTE_B_HOST", "b.test"),
             ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
             ("PINGENV_ROUTE_B_FALLBACK", "/index.html"),
+            ("PINGENV_ROUTE_B_COMPRESS", "true"),
         ])
         .unwrap_err();
         let all = errs.join("\n");
@@ -1197,6 +1407,11 @@ mod tests {
         );
         assert!(
             all.contains("PINGENV_ROUTE_B_FALLBACK: only applies"),
+            "{all}"
+        );
+        // Compressing what an upstream sends is the upstream's business.
+        assert!(
+            all.contains("PINGENV_ROUTE_B_COMPRESS: only applies"),
             "{all}"
         );
     }

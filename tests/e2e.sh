@@ -47,12 +47,28 @@ wait_for_port() {
 wait_for_exit() {
     for _ in $(seq 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
 }
+stopped_within() { # stopped_within <pid> <seconds>: SIGTERM, then is it gone in time?
+    kill -TERM "$1"
+    for _ in $(seq $(($2 * 10))); do kill -0 "$1" 2>/dev/null || { echo yes; return; }; sleep 0.1; done
+    echo no
+}
+make_cert() { # make_cert <dir> <common name> <dns name>: writes cert.tmp and key.tmp there
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+        -keyout "$1/key.tmp" -out "$1/cert.tmp" -subj "/CN=$2" \
+        -addext "subjectAltName=DNS:$3" 2>/dev/null
+}
+install_cert() { mv "$1/key.tmp" "$1/key.pem"; mv "$1/cert.tmp" "$1/cert.pem"; }
+fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256; }
+served_fingerprint() { # served_fingerprint <port> <server name>
+    openssl s_client -connect "127.0.0.1:$1" -servername "$2" </dev/null 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha256
+}
 field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -73,6 +89,11 @@ OUT="$(env -i PINGENV_ROUTE_A_HOST=a.test PINGENV_ROUTE_A_UPSTREAM=a:1 PINGENV_T
 set -e
 check "unknown PINGENV_ variable is an error, unprefixed ones are ignored" \
     "$CODE $(grep -c '^  - ' <<<"$OUT") $(grep -c 'PINGENV_TLS_MOD: unknown setting' <<<"$OUT")" "2 1 1"
+set +e
+OUT="$(env -i PINGENV_ROUTE_A_HOST=a.test PINGENV_ROUTE_A_UPSTREAM=a:1 PINGENV_ACME_EMAIL=ops@a.test "$BIN" 2>&1)"; CODE=$?
+set -e
+check "ACME settings with no TLS mode stop it, instead of starting plain HTTP" \
+    "$CODE $(grep -c 'PINGENV_ACME_EMAIL: does nothing while PINGENV_TLS_MODE is off' <<<"$OUT")" "2 1"
 
 # A site to serve: small files, one file above the in-memory limit, things
 # that must never be served, and a symlink pointing out of the root.
@@ -92,6 +113,18 @@ ln -s .git "$SITE/repo"
 ln -s .env "$SITE/env.txt"
 head -c 300000 /dev/urandom >"$SITE/big.bin"
 BIG_SUM="$(sha256sum <"$SITE/big.bin")"
+# Text that shrinks: one file with nothing next to it, and one with
+# precompressed copies (a real gzip, and a stand-in for brotli, which curl
+# may not be able to decode: only the bytes and the headers are checked).
+for _ in $(seq 400); do echo 'function answer() { return 42; }'; done >"$SITE/auto.js"
+cp "$SITE/auto.js" "$SITE/pre.js"
+JS_SUM="$(sha256sum <"$SITE/auto.js")"
+python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' <"$SITE/pre.js" >"$SITE/pre.js.gz"
+printf 'brotli-stand-in' >"$SITE/pre.js.br"
+
+# A certificate for a host that two routes share, named on only one of them.
+OWN="$WORK/own"; mkdir -p "$OWN"
+make_cert "$OWN" own own.pingenv.test; install_cert "$OWN"
 
 echo "== self-signed mode"
 env -i \
@@ -116,6 +149,10 @@ env -i \
     PINGENV_ROUTE_PATHS_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_PATHS_MEMORY_PATHS=/css \
     PINGENV_ROUTE_SPLIT_HOST=split.pingenv.test PINGENV_ROUTE_SPLIT_UPSTREAM=127.0.0.1:18090 \
     PINGENV_ROUTE_WILD_HOST='*.wild.pingenv.test' PINGENV_ROUTE_WILD_UPSTREAM=127.0.0.1:18001 \
+    PINGENV_ROUTE_OWN_HOST=own.pingenv.test PINGENV_ROUTE_OWN_UPSTREAM=127.0.0.1:18001 \
+    PINGENV_ROUTE_OWN_TLS_CERT_FILE="$OWN/cert.pem" PINGENV_ROUTE_OWN_TLS_KEY_FILE="$OWN/key.pem" \
+    PINGENV_ROUTE_OWN2_HOST=own.pingenv.test PINGENV_ROUTE_OWN2_PATH=/two PINGENV_ROUTE_OWN2_UPSTREAM=127.0.0.1:18002 \
+    PINGENV_ROUTE_GONE_HOST=gone.pingenv.test PINGENV_ROUTE_GONE_UPSTREAM=no-such-name.invalid:80 \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -144,6 +181,16 @@ check "HSTS on proxied HTTPS responses" \
     "$(get -k -o /dev/null -D - "https://app.pingenv.test:$HTTPS/" | tr -d '\r' | awk -F': ' 'tolower($1)=="strict-transport-security"{print $2}')" "max-age=31536000"
 check "no HSTS on the plain HTTP redirect" \
     "$(get -o /dev/null -D - "http://app.pingenv.test:$HTTP/" | grep -ci strict-transport || true)" 0
+check "a Host that is not a host is refused" \
+    "$(get -o /dev/null -w '%{http_code}' -H 'Host: app.pingenv.test 200 route=admin' "http://app.pingenv.test:$HTTP/")" 400
+check "and never reaches the access log" \
+    "$(sleep 0.2; grep -c 'route=admin' "$WORK/selfsigned.log" || true)" 0
+check "HSTS when no route matches" \
+    "$(get -k -o /dev/null -D - -H 'Host: nope.test' "https://app.pingenv.test:$HTTPS/" | tr -d '\r' | awk -F': ' 'tolower($1)=="strict-transport-security"{print $2}')" "max-age=31536000"
+check "a certificate named on one route serves the host on all of them" \
+    "$([[ "$(served_fingerprint $HTTPS own.pingenv.test)" == "$(fingerprint "$OWN/cert.pem")" ]] && echo same || echo different)" same
+check "and the other route still routes" \
+    "$(get -k "https://own.pingenv.test:$HTTPS/two" | field 'd["upstream"]')" B
 check "absolute-form target that disagrees with Host is refused" \
     "$(get -k -o /dev/null -w '%{http_code}' --http1.1 --request-target "http://app.pingenv.test:$HTTPS/x" -H 'Host: admin.internal' "https://app.pingenv.test:$HTTPS/")" 400
 
@@ -159,6 +206,8 @@ check "prefix is stripped" "$(field 'd["path"]' <<<"$BODY")" "/users?id=7"
 check "SET_HOST overrides Host" "$(field 'd["headers"]["host"]' <<<"$BODY")" backend.internal
 check "an escaped letter still matches its route" \
     "$(get -k --path-as-is "https://app.pingenv.test:$HTTPS/%61pi/users?id=7" | field 'd["upstream"] + d["path"]')" "B/users?id=7"
+check "unescaped UTF-8 in a path is forwarded as it came" \
+    "$(python3 tests/raw_get.py $HTTPS "app.pingenv.test:$HTTPS" '/%61pi/café' | field 'd["path"].encode("latin-1").decode()')" "/café"
 check "/apix does not match /api" \
     "$(get -k "https://app.pingenv.test:$HTTPS/apix" | field 'd["upstream"]')" A
 
@@ -169,8 +218,10 @@ done
 check "round robin skips the dead upstream" "$(grep -o . <<<"$SEEN" | sort -u | tr -d '\n') ${#SEEN}" "AB 6"
 check "wildcard host" \
     "$(get -k "https://sub.wild.pingenv.test:$HTTPS/" | field 'd["upstream"]')" A
-check "upstream read timeout gives a gateway error" \
-    "$(get -k -o /dev/null -w '%{http_code}' "https://app.pingenv.test:$HTTPS/sleep/5")" 502
+check "upstream read timeout gives a gateway error, with HSTS like any other response" \
+    "$(get -k -o /dev/null -D - -w '%{http_code}' "https://app.pingenv.test:$HTTPS/sleep/5" | tr -d '\r' | awk -F': ' 'tolower($1)=="strict-transport-security"{printf "%s ", $2} END{print $0}')" "max-age=31536000 502"
+check "an upstream whose name does not resolve is a gateway error too, and is named in the log" \
+    "$(get -k -o /dev/null -w '%{http_code}' "https://gone.pingenv.test:$HTTPS/") $(sleep 0.2; grep -c 'gone.pingenv.test/ 502 route=gone upstream=no-such-name.invalid:80' "$WORK/selfsigned.log")" "502 1"
 check "a route can raise its own read timeout" \
     "$(get -k -o /dev/null -w '%{http_code}' "https://slow.pingenv.test:$HTTPS/sleep/3")" 200
 check "acme challenge without a token is not forwarded by default" \
@@ -180,7 +231,7 @@ check "with ACME_PASSTHROUGH it reaches the upstream, with no redirect" \
 check "other paths on that route are still redirected" \
     "$(get -o /dev/null -w '%{http_code}' "http://pt.pingenv.test:$HTTP/other")" 308
 check "access log has one line per request" \
-    "$(grep -c 'route=api upstream=localhost:18002' "$WORK/selfsigned.log")" 2
+    "$(grep -c 'route=api upstream=localhost:18002' "$WORK/selfsigned.log")" 3
 
 echo "== static files"
 S="https://site.pingenv.test:$HTTPS"
@@ -219,6 +270,9 @@ check "directory index" "$(get -k "$S/docs/")" '<h1>docs</h1>'
 check "redirect target cannot become another host" \
     "$(get -k --path-as-is -o /dev/null -w '%{http_code} %{redirect_url}' "$S//docs")" "308 $S/docs/"
 check "HSTS on files" "$(hdr strict-transport-security "$S/css/site.css")" "max-age=31536000"
+check "HSTS on the file server's own answers: 404, redirect, 405, 416" \
+    "$(hdr strict-transport-security "$S/missing.js") $(hdr strict-transport-security "$S/docs") $(hdr strict-transport-security -X POST "$S/") $(hdr strict-transport-security -r 999999- "$S/big.bin")" \
+    "max-age=31536000 max-age=31536000 max-age=31536000 max-age=31536000"
 check "directory without index is not listed" "$(code "https://live.pingenv.test:$HTTPS/empty/")" 404
 check "dotfile is refused" "$(code "$S/.env")" 404
 check "dot directory is refused" "$(code "$S/.git/config")" 404
@@ -234,6 +288,41 @@ check "fallback for application routes" "$(get -k "$S/users/42")" '<h1>home</h1>
 check "no fallback for missing assets" "$(code "$S/missing.js")" 404
 check "POST is refused" "$(code -X POST "$S/")" 405
 
+echo "== compression"
+L="https://live.pingenv.test:$HTTPS"
+size() { get -k -o /dev/null -w '%{size_download}' "$@"; }
+PLAIN_SIZE="$(size "$S/auto.js")"
+check "a file held in memory is sent gzipped to a client that asks" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip' "$S/auto.js") $(get -k --compressed "$S/auto.js" | sha256sum)" "gzip $JS_SUM"
+check "and is much smaller on the wire" \
+    "$(( $(size -H 'Accept-Encoding: gzip' "$S/auto.js") * 10 < PLAIN_SIZE )) $(src 'site.pingenv.test/auto.js')" "1 upstream=memory"
+check "a client that does not ask gets the file as it is" \
+    "$(hdr content-encoding "$S/auto.js")|$(get -k "$S/auto.js" | sha256sum)" "|$JS_SUM"
+check "both answers say they depend on Accept-Encoding" \
+    "$(hdr vary "$S/auto.js") / $(hdr vary -H 'Accept-Encoding: gzip' "$S/auto.js")" "Accept-Encoding / Accept-Encoding"
+check "the type is the file's, not the coding's" \
+    "$(hdr content-type -H 'Accept-Encoding: gzip' "$S/auto.js")" 'text/javascript; charset=utf-8'
+GZ_TAG="$(hdr etag -H 'Accept-Encoding: gzip' "$S/auto.js")"
+check "the compressed copy has its own ETag" \
+    "$([[ -n "$GZ_TAG" && "$GZ_TAG" != "$(hdr etag "$S/auto.js")" ]] && echo distinct || echo same)" distinct
+check "which revalidates to a 304" \
+    "$(code -H 'Accept-Encoding: gzip' -H "If-None-Match: $GZ_TAG" "$S/auto.js") $(code -H "If-None-Match: $GZ_TAG" "$S/auto.js")" "304 200"
+check "q=0 refuses a coding" "$(hdr content-encoding -H 'Accept-Encoding: gzip;q=0' "$S/auto.js")" ""
+check "what does not shrink is left alone" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip, br' "$S/big.bin")|$(hdr vary -H 'Accept-Encoding: gzip, br' "$S/big.bin")" "|"
+check "a file on disk with no copy next to it is not compressed" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip, br' "$L/auto.js")|$(get -k --compressed "$L/auto.js" | sha256sum)" "|$JS_SUM"
+check "a precompressed copy next to a file on disk is sent in its place" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip' "$L/pre.js") $(get -k --compressed -H 'Accept-Encoding: gzip' "$L/pre.js" | sha256sum) $(src 'live.pingenv.test/pre.js')" "gzip $JS_SUM upstream=disk"
+check "brotli is preferred when the client reads both" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip, br' "$L/pre.js") $(get -k -H 'Accept-Encoding: gzip, br' "$L/pre.js")" "br brotli-stand-in"
+check "the same copies are used for a file held in memory" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip, br' "$S/pre.js") $(get -k -H 'Accept-Encoding: br' "$S/pre.js") $(src 'site.pingenv.test/pre.js')" "br brotli-stand-in upstream=memory"
+check "a range is a range of what is sent" \
+    "$(code -r 0-4 -H 'Accept-Encoding: br' "$L/pre.js") $(get -k -r 0-4 -H 'Accept-Encoding: br' "$L/pre.js") $(hdr content-range -r 0-4 -H 'Accept-Encoding: br' "$L/pre.js")" "206 brotl bytes 0-4/15"
+check "HEAD reports the compressed length" \
+    "$(get -k -I -H 'Accept-Encoding: br' "$L/pre.js" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-length"{print $2}')" 15
+
 A="https://app.pingenv.test:$HTTPS/static"
 check "files under a path prefix" "$(get -k "$A/css/site.css")" 'body{}'
 check "prefix root serves the index" "$(get -k "$A/")" '<h1>home</h1>'
@@ -244,7 +333,6 @@ check "no fallback unless configured" "$(code "$A/users/42")" 404
 check "other paths still reach the upstream" \
     "$(get -k "https://app.pingenv.test:$HTTPS/statics" | field 'd["upstream"]')" A
 
-L="https://live.pingenv.test:$HTTPS"
 check "limit 0 serves small files from disk" "$(get -k "$L/css/site.css") $(src 'live.pingenv.test/css/site.css')" 'body{} upstream=disk'
 echo 'body{color:red}' >"$SITE/css/site.css"
 echo 'new' >"$SITE/new.txt"
@@ -279,19 +367,30 @@ check "edge proxied it, file server answered from memory" \
 check "large file through both is intact" "$(get -k "$P/big.bin" | sha256sum)" "$BIG_SUM"
 check "range through both" "$(code -r 0-99 "$P/big.bin") $(hdr content-range -r 0-99 "$P/big.bin")" "206 bytes 0-99/300000"
 check "304 through both" "$(code -H "If-None-Match: $(hdr etag "$P/big.bin")" "$P/big.bin")" 304
-kill -TERM $INNER
-wait_for_exit $INNER
+check "compressed through both: the edge passes it on untouched" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip' "$P/auto.js") $(get -k --compressed "$P/auto.js" | sha256sum)" "gzip $JS_SUM"
+check "an idle server exits at once on SIGTERM, not after the grace period" "$(stopped_within $INNER 2)" yes
 check "file server down gives 502 on its route" "$(code "$P/docs/")" 502
 check "other routes are unaffected" "$(get -k "https://app.pingenv.test:$HTTPS/" | field 'd["upstream"]')" A
 
 HEALTH=(env -i PINGENV_HTTP_ADDR=127.0.0.1:$HTTP PINGENV_ROUTE_A_HOST=a.test PINGENV_ROUTE_A_UPSTREAM=a:1 "$BIN" --healthcheck)
 set +e; "${HEALTH[@]}" 2>/dev/null; HEALTHY=$?; set -e
 check "--healthcheck succeeds while the server listens" "$HEALTHY" 0
+# A request that takes two seconds, and SIGTERM half a second into it.
+get -k -o /dev/null -w '%{http_code}' "https://slow.pingenv.test:$HTTPS/sleep/2" >"$WORK/inflight.out" &
+INFLIGHT=$!
+sleep 0.5
 kill -TERM $GATE
+sleep 1
+check "SIGTERM waits for a request in flight" "$(kill -0 $GATE 2>/dev/null && echo running || echo stopped)" running
+wait $INFLIGHT || true
+check "which is answered in full" "$(cat "$WORK/inflight.out")" 200
+sleep 1
+check "and the server exits when it is done, without sitting out the grace period" \
+    "$(kill -0 $GATE 2>/dev/null && echo running || echo stopped)" stopped
 wait_for_exit $GATE
 set +e; "${HEALTH[@]}" 2>/dev/null; DOWN=$?; set -e
 check "--healthcheck fails once it stopped" "$DOWN" 1
-check "exits on SIGTERM within 10s" "$(kill -0 $GATE 2>/dev/null && echo running || echo stopped)" stopped
 
 set +e
 OUT="$(env -i PINGENV_ROUTE_S_HOST=s.test PINGENV_ROUTE_S_ROOT="$SITE" PINGENV_ROUTE_S_MEMORY_MAX_FILE=1MiB PINGENV_MEMORY_MAX_TOTAL=10 \
@@ -302,34 +401,28 @@ check "exceeding the memory cap fails at startup" \
 
 echo "== manual certificates are reloaded when the files change"
 CERTDIR="$WORK/manual"; mkdir -p "$CERTDIR"
-make_cert() { # make_cert <common name>
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
-        -keyout "$CERTDIR/key.tmp" -out "$CERTDIR/cert.tmp" -subj "/CN=$1" \
-        -addext "subjectAltName=DNS:m.pingenv.test" 2>/dev/null
-}
-served_fingerprint() {
-    openssl s_client -connect 127.0.0.1:18444 -servername m.pingenv.test </dev/null 2>/dev/null \
-        | openssl x509 -noout -fingerprint -sha256
-}
-make_cert first; mv "$CERTDIR/key.tmp" "$CERTDIR/key.pem"; mv "$CERTDIR/cert.tmp" "$CERTDIR/cert.pem"
+make_cert "$CERTDIR" first m.pingenv.test; install_cert "$CERTDIR"
 env -i PINGENV_HTTP_ADDR=127.0.0.1:18081 PINGENV_HTTPS_ADDR=127.0.0.1:18444 PINGENV_TLS_MODE=manual \
     PINGENV_HTTPS_REDIRECT=false PINGENV_CERT_RELOAD_INTERVAL=1s \
     PINGENV_ROUTE_M_HOST=m.pingenv.test PINGENV_ROUTE_M_UPSTREAM=127.0.0.1:18001 \
     PINGENV_ROUTE_M_TLS_CERT_FILE="$CERTDIR/cert.pem" PINGENV_ROUTE_M_TLS_KEY_FILE="$CERTDIR/key.pem" \
+    PINGENV_ROUTE_M2_HOST=m.pingenv.test PINGENV_ROUTE_M2_PATH=/two PINGENV_ROUTE_M2_UPSTREAM=127.0.0.1:18002 \
     "$BIN" >"$WORK/manual.log" 2>&1 &
 MANUAL=$!; PIDS+=($MANUAL)
 wait_for_port 18444
-BEFORE="$(served_fingerprint)"
+BEFORE="$(served_fingerprint 18444 m.pingenv.test)"
 check "the certificate from the files is served" \
-    "$([[ "$BEFORE" == "$(openssl x509 -in "$CERTDIR/cert.pem" -noout -fingerprint -sha256)" ]] && echo same || echo different)" same
-make_cert second-with-a-longer-name; mv "$CERTDIR/key.tmp" "$CERTDIR/key.pem"; mv "$CERTDIR/cert.tmp" "$CERTDIR/cert.pem"
+    "$([[ "$BEFORE" == "$(fingerprint "$CERTDIR/cert.pem")" ]] && echo same || echo different)" same
+check "a second route for the host needs no files of its own" \
+    "$(curl -sS --max-time 10 -k --resolve m.pingenv.test:18444:127.0.0.1 "https://m.pingenv.test:18444/two" | field 'd["upstream"]')" B
+make_cert "$CERTDIR" second-with-a-longer-name m.pingenv.test; install_cert "$CERTDIR"
 AFTER="$BEFORE"
-for _ in $(seq 50); do AFTER="$(served_fingerprint)"; [[ "$AFTER" != "$BEFORE" ]] && break; sleep 0.2; done
+for _ in $(seq 50); do AFTER="$(served_fingerprint 18444 m.pingenv.test)"; [[ "$AFTER" != "$BEFORE" ]] && break; sleep 0.2; done
 check "a renewed certificate is served without a restart" \
-    "$([[ "$AFTER" == "$(openssl x509 -in "$CERTDIR/cert.pem" -noout -fingerprint -sha256)" ]] && echo same || echo different)" same
+    "$([[ "$AFTER" == "$(fingerprint "$CERTDIR/cert.pem")" ]] && echo same || echo different)" same
 echo "not a certificate" >"$CERTDIR/cert.pem"
 sleep 3
-check "a broken replacement keeps the previous certificate" "$(served_fingerprint)" "$AFTER"
+check "a broken replacement keeps the previous certificate" "$(served_fingerprint 18444 m.pingenv.test)" "$AFTER"
 check "and says so" "$(grep -c 'keeping the previous certificate' "$WORK/manual.log" || true)" 1
 kill -TERM $MANUAL; wait_for_exit $MANUAL
 
@@ -353,6 +446,9 @@ if [[ -n "$PEBBLE_DIR" ]]; then
             PINGENV_ACME_CA_FILE="$MINICA" PINGENV_ACME_EMAIL=ops@pingenv.test PINGENV_DATA_DIR="$WORK/data" \
             PINGENV_ROUTE_APP_HOST=app.pingenv.test PINGENV_ROUTE_APP_UPSTREAM=127.0.0.1:18001 \
             PINGENV_ROUTE_APP2_HOST=app2.pingenv.test PINGENV_ROUTE_APP2_UPSTREAM=127.0.0.1:18001 \
+            PINGENV_ROUTE_OWN_HOST=own.pingenv.test PINGENV_ROUTE_OWN_UPSTREAM=127.0.0.1:18001 \
+            PINGENV_ROUTE_OWN_TLS_CERT_FILE="$OWN/cert.pem" PINGENV_ROUTE_OWN_TLS_KEY_FILE="$OWN/key.pem" \
+            PINGENV_ROUTE_OWN2_HOST=own.pingenv.test PINGENV_ROUTE_OWN2_PATH=/two PINGENV_ROUTE_OWN2_UPSTREAM=127.0.0.1:18002 \
             "$BIN" >"$1" 2>&1 &
         GATE=$!; PIDS+=($GATE)
         wait_for_port $HTTPS
@@ -367,6 +463,11 @@ if [[ -n "$PEBBLE_DIR" ]]; then
     check "two hosts each get their own certificate" \
         "$(grep -c 'requesting certificate' "$WORK/acme1.log") $(grep -c 'app2.pingenv.test: certificate issued' "$WORK/acme1.log")" "2 1"
     check "certificate is stored" "$([[ -s "$CERT" ]] && echo yes || echo no)" yes
+    # own.pingenv.test is on two routes and only one names its files.
+    check "a host with certificate files is not requested from the CA, on any of its routes" \
+        "$(grep -c 'own.pingenv.test: requesting' "$WORK/acme1.log" || true)" 0
+    check "and its files are what is served" \
+        "$([[ "$(served_fingerprint $HTTPS own.pingenv.test)" == "$(fingerprint "$OWN/cert.pem")" ]] && echo same || echo different)" same
     check "private key is owner-only" "$(stat -c %a "$(dirname "$CERT")/privkey.pem")" 600
 
     curl -sS --cacert "$MINICA" https://localhost:15000/roots/0 >"$WORK/root.pem"
