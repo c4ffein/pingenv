@@ -86,7 +86,10 @@ jobs:
           docker run -d --name pingenv -p 8080:80 -v "$PWD/tests:/srv/site:ro" \
             -e PINGENV_ROUTE_SITE_HOST=localhost -e PINGENV_ROUTE_SITE_ROOT=/srv/site \
             pingenv:ci
-          curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused \
+          # Docker's proxy accepts on the published port before pingenv is
+          # listening and then drops the connection, so an early request is
+          # reset rather than refused: retry on any error, not only a refusal.
+          curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-all-errors \
             --output /dev/null http://localhost:8080/e2e.sh
           docker exec pingenv /pingenv --healthcheck
       - name: Container log
