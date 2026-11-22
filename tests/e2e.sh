@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test: runs the real binary against local upstreams.
 #
-#   tests/e2e.sh                      routing, redirects, self-signed TLS
+#   tests/e2e.sh                      routing, redirects, limits, self-signed TLS
 #   tests/e2e.sh --acme <pebble-dir>  also issues a certificate from Pebble,
 #                                     Let's Encrypt's ACME test server
 #
@@ -68,7 +68,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test up.pingenv.test idle.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -153,6 +153,7 @@ env -i \
     PINGENV_ROUTE_OWN_TLS_CERT_FILE="$OWN/cert.pem" PINGENV_ROUTE_OWN_TLS_KEY_FILE="$OWN/key.pem" \
     PINGENV_ROUTE_OWN2_HOST=own.pingenv.test PINGENV_ROUTE_OWN2_PATH=/two PINGENV_ROUTE_OWN2_UPSTREAM=127.0.0.1:18002 \
     PINGENV_ROUTE_GONE_HOST=gone.pingenv.test PINGENV_ROUTE_GONE_UPSTREAM=no-such-name.invalid:80 \
+    PINGENV_ROUTE_UP_HOST=up.pingenv.test PINGENV_ROUTE_UP_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_UP_MAX_BODY_SIZE=3MiB \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -175,8 +176,8 @@ check "X-Forwarded-Proto" "$(field 'd["headers"]["x-forwarded-proto"]' <<<"$BODY
 check "spoofed X-Forwarded-For is replaced" "$(field 'd["headers"]["x-forwarded-for"]' <<<"$BODY")" 127.0.0.1
 check "X-Forwarded-Host keeps the port" "$(field 'd["headers"]["x-forwarded-host"]' <<<"$BODY")" "app.pingenv.test:$HTTPS"
 check "X-Forwarded-Port is what the client used" "$(field 'd["headers"]["x-forwarded-port"]' <<<"$BODY")" "$HTTPS"
-check "spoofed X-Real-IP and Forwarded are dropped" \
-    "$(field 'd["headers"].get("x-real-ip", "-") + d["headers"].get("forwarded", "-")' <<<"$BODY")" "--"
+check "spoofed X-Real-IP is replaced too" "$(field 'd["headers"]["x-real-ip"]' <<<"$BODY")" 127.0.0.1
+check "spoofed Forwarded is dropped" "$(field 'd["headers"].get("forwarded", "-")' <<<"$BODY")" "-"
 check "HSTS on proxied HTTPS responses" \
     "$(get -k -o /dev/null -D - "https://app.pingenv.test:$HTTPS/" | tr -d '\r' | awk -F': ' 'tolower($1)=="strict-transport-security"{print $2}')" "max-age=31536000"
 check "no HSTS on the plain HTTP redirect" \
@@ -232,6 +233,27 @@ check "other paths on that route are still redirected" \
     "$(get -o /dev/null -w '%{http_code}' "http://pt.pingenv.test:$HTTP/other")" 308
 check "access log has one line per request" \
     "$(grep -c 'route=api upstream=localhost:18002' "$WORK/selfsigned.log")" 3
+
+echo "== request body limit"
+head -c $((512 * 1024)) /dev/zero >"$WORK/half.bin"
+head -c $((2 * 1024 * 1024)) /dev/zero >"$WORK/two.bin"
+head -c $((4 * 1024 * 1024)) /dev/zero >"$WORK/four.bin"
+# `Expect:` makes curl send the body at once instead of asking first, which
+# is what a browser does: the answer has to reach a client that is mid-upload.
+post() { get -k -H 'Expect:' "${@:2}" --data-binary @"$WORK/$1.bin"; }
+U="https://app.pingenv.test:$HTTPS/upload"
+check "a body within the limit reaches the upstream whole" "$(post half "$U" | field 'd["body_bytes"]')" 524288
+check "a body over the default limit is refused" "$(post two -o /dev/null -w '%{http_code}' "$U")" 413
+check "and the upstream is never asked" \
+    "$(sleep 0.2; grep -c 'POST app.pingenv.test/upload 413 route=app upstream=- ' "$WORK/selfsigned.log")" 1
+check "a body that does not say how long it is gets counted, and refused once over" \
+    "$(post two -o /dev/null -w '%{http_code}' -H 'Transfer-Encoding: chunked' "$U") $(post half -H 'Transfer-Encoding: chunked' "$U" | field 'd["body_bytes"]')" "413 524288"
+check "the same over HTTP/2, with a length and without" \
+    "$(post two -o /dev/null -w '%{http_code}' --http2 "$U") $(get -k -o /dev/null -w '%{http_code}' --http2 -X POST -T - "$U" <"$WORK/two.bin")" "413 413"
+check "a body over the limit is not reported as an error of the proxy's" \
+    "$(grep -c 'ERROR.*over the limit' "$WORK/selfsigned.log" || true)" 0
+check "a route can raise the limit for itself" \
+    "$(post two "https://up.pingenv.test:$HTTPS/" | field 'd["body_bytes"]') $(post four -o /dev/null -w '%{http_code}' "https://up.pingenv.test:$HTTPS/")" "2097152 413"
 
 echo "== static files"
 S="https://site.pingenv.test:$HTTPS"
@@ -351,6 +373,27 @@ echo "== websocket"
 check "upgrade is proxied and bytes flow both ways" \
     "$(python3 tests/ws_client.py $HTTPS ws.pingenv.test)" \
     "HTTP/1.1 101 Switching Protocols | accept=ok | echo=hello through the proxy"
+check "and is not held to the request body limit: it is not a request body" \
+    "$(python3 tests/ws_client.py $HTTPS ws.pingenv.test 3145728)" \
+    "HTTP/1.1 101 Switching Protocols | accept=ok | echo=hello through the proxy | carried=3145728"
+
+echo "== idle connections"
+# The gateway above has the default limit, far longer than this looks for.
+check "an idle connection is kept for the next request" \
+    "$(python3 tests/idle_client.py $HTTPS app.pingenv.test h1 2)" "reused open"
+env -i PINGENV_HTTP_ADDR=127.0.0.1:18082 PINGENV_HTTPS_ADDR=127.0.0.1:18445 PINGENV_TLS_MODE=selfsigned \
+    PINGENV_IDLE_TIMEOUT=1s \
+    PINGENV_ROUTE_IDLE_HOST=idle.pingenv.test PINGENV_ROUTE_IDLE_UPSTREAM=127.0.0.1:18001 \
+    "$BIN" >"$WORK/idle.log" 2>&1 &
+IDLE=$!; PIDS+=($IDLE)
+wait_for_port 18445
+check "but not for longer than the idle timeout" \
+    "$(python3 tests/idle_client.py 18445 idle.pingenv.test h1 4)" "reused closed"
+check "however long the client asks for" \
+    "$(python3 tests/idle_client.py 18445 idle.pingenv.test h1-asks 4)" "reused closed"
+check "an idle HTTP/2 connection is closed as well" \
+    "$(python3 tests/idle_client.py 18445 idle.pingenv.test h2 4)" "closed"
+kill -TERM $IDLE; wait_for_exit $IDLE
 
 echo "== split layout: one pingenv as the edge, another as the file server"
 env -i PINGENV_HTTP_ADDR=127.0.0.1:18090 \
@@ -403,7 +446,7 @@ echo "== manual certificates are reloaded when the files change"
 CERTDIR="$WORK/manual"; mkdir -p "$CERTDIR"
 make_cert "$CERTDIR" first m.pingenv.test; install_cert "$CERTDIR"
 env -i PINGENV_HTTP_ADDR=127.0.0.1:18081 PINGENV_HTTPS_ADDR=127.0.0.1:18444 PINGENV_TLS_MODE=manual \
-    PINGENV_HTTPS_REDIRECT=false PINGENV_CERT_RELOAD_INTERVAL=1s \
+    PINGENV_HTTPS_REDIRECT=false PINGENV_CERT_RELOAD_INTERVAL=1s PINGENV_HTTP2=false \
     PINGENV_ROUTE_M_HOST=m.pingenv.test PINGENV_ROUTE_M_UPSTREAM=127.0.0.1:18001 \
     PINGENV_ROUTE_M_TLS_CERT_FILE="$CERTDIR/cert.pem" PINGENV_ROUTE_M_TLS_KEY_FILE="$CERTDIR/key.pem" \
     PINGENV_ROUTE_M2_HOST=m.pingenv.test PINGENV_ROUTE_M2_PATH=/two PINGENV_ROUTE_M2_UPSTREAM=127.0.0.1:18002 \
@@ -415,6 +458,8 @@ check "the certificate from the files is served" \
     "$([[ "$BEFORE" == "$(fingerprint "$CERTDIR/cert.pem")" ]] && echo same || echo different)" same
 check "a second route for the host needs no files of its own" \
     "$(curl -sS --max-time 10 -k --resolve m.pingenv.test:18444:127.0.0.1 "https://m.pingenv.test:18444/two" | field 'd["upstream"]')" B
+check "with PINGENV_HTTP2=false a client that offers HTTP/2 gets HTTP/1.1" \
+    "$(curl -sS --max-time 10 -k --http2 -o /dev/null -w '%{http_version}' --resolve m.pingenv.test:18444:127.0.0.1 "https://m.pingenv.test:18444/")" 1.1
 make_cert "$CERTDIR" second-with-a-longer-name m.pingenv.test; install_cert "$CERTDIR"
 AFTER="$BEFORE"
 for _ in $(seq 50); do AFTER="$(served_fingerprint 18444 m.pingenv.test)"; [[ "$AFTER" != "$BEFORE" ]] && break; sleep 0.2; done

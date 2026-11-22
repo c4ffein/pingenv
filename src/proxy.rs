@@ -2,7 +2,7 @@
 //! redirect plain HTTP to HTTPS, and forward everything else upstream.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -379,6 +379,9 @@ pub struct Gateway {
     https_redirect: bool,
     https_redirect_port: u16,
     timeouts: Timeouts,
+    /// Whole seconds, which is what Pingora counts keep-alive in.
+    idle_seconds: Option<u64>,
+    max_body_size: Option<u64>,
     hsts: Option<String>,
     in_flight: InFlight,
 }
@@ -400,6 +403,8 @@ impl Gateway {
             https_redirect: config.https_redirect,
             https_redirect_port: config.https_redirect_port,
             timeouts: config.timeouts,
+            idle_seconds: config.timeouts.client_idle.map(whole_seconds),
+            max_body_size: config.max_body_size,
             hsts: config.hsts.clone(),
         }
     }
@@ -414,8 +419,46 @@ pub struct RequestCtx {
     upstream: Option<String>,
     connect_failures: u32,
     started: Option<Instant>,
+    /// The most this request's body may come to, and what has arrived so far.
+    body_limit: Option<u64>,
+    body_seen: u64,
     /// Held, not read: the request is counted for as long as this lives.
     _in_flight: Option<Entered>,
+}
+
+/// Rounded up, and never zero: to Pingora a keep-alive of zero seconds means
+/// "for ever".
+fn whole_seconds(d: Duration) -> u64 {
+    d.as_secs()
+        .saturating_add(u64::from(d.subsec_nanos() > 0))
+        .max(1)
+}
+
+/// The keep-alive to use, given what Pingora took from the request: `None`
+/// when the connection closes after this response anyway, zero for "no
+/// limit". By default that is no limit, or whatever the client asked for in
+/// `Keep-Alive: timeout=`; neither is the client's to decide.
+fn capped_keepalive(asked: Option<u64>, limit: Option<u64>) -> Option<u64> {
+    match (asked?, limit) {
+        (0, Some(limit)) => Some(limit),
+        (asked, Some(limit)) => Some(asked.min(limit)),
+        (asked, None) => Some(asked),
+    }
+}
+
+/// The length a request says its body has. `None` when it does not say (a
+/// chunked body, or none at all): that one is counted as it arrives.
+fn declared_length(req: &RequestHeader) -> Option<u64> {
+    let value = req.headers.get(http::header::CONTENT_LENGTH)?;
+    value.to_str().ok()?.trim().parse().ok()
+}
+
+/// The client's address as the application should see it. On a listener bound
+/// to `[::]` an IPv4 client arrives as `::ffff:192.0.2.1`; that is still
+/// `192.0.2.1` to everything that reads addresses.
+fn client_ip(session: &Session) -> Option<IpAddr> {
+    let addr = session.client_addr()?.as_inet()?;
+    Some(addr.ip().to_canonical())
 }
 
 fn is_tls(session: &Session) -> bool {
@@ -467,6 +510,11 @@ impl ProxyHttp for Gateway {
         ctx.started = Some(Instant::now());
         // The client has to keep reading the response too.
         session.set_write_timeout(self.timeouts.write);
+        // And cannot hold the connection for ever between two requests.
+        // (HTTP/2 connections get the same limit where the listener is set
+        // up; this call does nothing for them.)
+        let keepalive = capped_keepalive(session.get_keepalive(), self.idle_seconds);
+        session.set_keepalive(keepalive);
         let tls = is_tls(session);
         let hsts = self.hsts.as_deref().filter(|_| tls);
         normalize_request_path(session)?;
@@ -475,6 +523,25 @@ impl ProxyHttp for Gateway {
 
         if let Some(why) = bad_host(req) {
             respond(session, 400, &[], why, hsts).await?;
+            return Ok(true);
+        }
+
+        // Looked up before anything is answered, so that the limit on the
+        // body is the route's own if it has one, whatever the answer is.
+        let host = request_host(req);
+        let route = host.as_deref().and_then(|h| self.router.find(h, &path));
+        ctx.body_limit = route
+            .and_then(|r| self.router.routes[r].max_body_size)
+            .unwrap_or(self.max_body_size);
+        if let Some(limit) = ctx.body_limit
+            && declared_length(req).is_some_and(|length| length > limit)
+        {
+            ctx.host = host.unwrap_or_default();
+            ctx.route = route;
+            // The body is not going to be read, so the connection cannot be
+            // used for another request.
+            session.set_keepalive(None);
+            respond(session, 413, &[], "request body too large\n", hsts).await?;
             return Ok(true);
         }
 
@@ -498,12 +565,12 @@ impl ProxyHttp for Gateway {
             return Ok(true);
         }
 
-        let Some(host) = request_host(req) else {
+        let Some(host) = host else {
             respond(session, 400, &[], "missing host\n", hsts).await?;
             return Ok(true);
         };
         ctx.forwarded_host = client_authority(req).unwrap_or_else(|| host.clone());
-        let Some(route) = self.router.find(&host, &path) else {
+        let Some(route) = route else {
             ctx.host = host;
             respond(session, 404, &[], "no route for this host\n", hsts).await?;
             return Ok(true);
@@ -562,6 +629,33 @@ impl ProxyHttp for Gateway {
         Ok(Box::new(peer))
     }
 
+    /// A body that did not say how long it is (chunked, or HTTP/2 without a
+    /// `Content-Length`) is measured here, as it goes by. What is over the
+    /// limit is not passed on; what came before it already was, and the
+    /// upstream sees that request cut short.
+    ///
+    /// What a client sends on a connection the upstream has upgraded (a
+    /// WebSocket) comes through here too, and is not a request body: it has
+    /// no size to hold it to.
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut RequestCtx,
+    ) -> Result<()> {
+        if let Some(limit) = ctx.body_limit
+            && let Some(chunk) = body
+            && !session.was_upgraded()
+        {
+            ctx.body_seen += chunk.len() as u64;
+            if ctx.body_seen > limit {
+                return Error::e_explain(HTTPStatus(413), "request body over the limit");
+            }
+        }
+        Ok(())
+    }
+
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -576,8 +670,9 @@ impl ProxyHttp for Gateway {
         for name in ["Forwarded", "X-Real-IP", "X-Forwarded-Server"] {
             upstream_request.remove_header(name);
         }
-        if let Some(addr) = session.client_addr().and_then(|a| a.as_inet()) {
-            upstream_request.insert_header("X-Forwarded-For", addr.ip().to_string())?;
+        if let Some(ip) = client_ip(session) {
+            upstream_request.insert_header("X-Forwarded-For", ip.to_string())?;
+            upstream_request.insert_header("X-Real-IP", ip.to_string())?;
         }
         let tls = is_tls(session);
         upstream_request.insert_header("X-Forwarded-Proto", if tls { "https" } else { "http" })?;
@@ -667,6 +762,12 @@ impl ProxyHttp for Gateway {
         }
     }
 
+    /// A body over the limit is the client's doing, and the access log has
+    /// it as a 413: it is not an error of this proxy's to report.
+    fn suppress_error_log(&self, _session: &Session, _ctx: &RequestCtx, e: &Error) -> bool {
+        matches!(e.etype(), HTTPStatus(413))
+    }
+
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -685,10 +786,7 @@ impl ProxyHttp for Gateway {
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut RequestCtx) {
         let req = session.req_header();
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
-        let client = session
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map_or_else(|| "-".to_string(), |a| a.ip().to_string());
+        let client = client_ip(session).map_or_else(|| "-".to_string(), |ip| ip.to_string());
         let route = ctx
             .route
             .map_or("-", |i| self.router.routes[i].name.as_str());
@@ -721,6 +819,7 @@ mod tests {
             cert_files: None,
             acme_passthrough: false,
             read_timeout: None,
+            max_body_size: None,
         }
     }
 
@@ -866,6 +965,36 @@ mod tests {
             decode_unreserved("/%61/caf%C3%A9").as_deref(),
             Some("/a/caf%C3%A9")
         );
+    }
+
+    #[test]
+    fn keepalive_is_never_longer_than_the_idle_timeout() {
+        // What Pingora takes from the request: zero is "for ever", its
+        // default for HTTP/1.1; a number is what `Keep-Alive: timeout=` asked.
+        assert_eq!(capped_keepalive(Some(0), Some(75)), Some(75));
+        assert_eq!(capped_keepalive(Some(600), Some(75)), Some(75));
+        assert_eq!(capped_keepalive(Some(5), Some(75)), Some(5));
+        // `Connection: close`, or a server that is shutting down, stays closed.
+        assert_eq!(capped_keepalive(None, Some(75)), None);
+        // PINGENV_IDLE_TIMEOUT=0: as Pingora has it.
+        assert_eq!(capped_keepalive(Some(0), None), Some(0));
+        assert_eq!(capped_keepalive(None, None), None);
+
+        // A fraction of a second must not round down to "for ever".
+        assert_eq!(whole_seconds(Duration::from_millis(200)), 1);
+        assert_eq!(whole_seconds(Duration::from_millis(1500)), 2);
+        assert_eq!(whole_seconds(Duration::from_secs(75)), 75);
+    }
+
+    #[test]
+    fn the_declared_length_is_read_from_content_length() {
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        assert_eq!(declared_length(&req), None);
+        req.insert_header("Content-Length", "1048577").unwrap();
+        assert_eq!(declared_length(&req), Some(1_048_577));
+        // Not a number: nothing declared, so the body is counted as it comes.
+        req.insert_header("Content-Length", "lots").unwrap();
+        assert_eq!(declared_length(&req), None);
     }
 
     #[test]

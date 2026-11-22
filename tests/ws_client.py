@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Opens a WebSocket through the proxy and checks that bytes flow both ways.
 
-usage: ws_client.py <connect-port> <host-header>   (HTTPS, certificate not verified)
+usage: ws_client.py <connect-port> <host-header> [bytes]   (HTTPS, certificate not verified)
+
+With [bytes], that much more is sent afterwards and has to come back: a
+connection that has been upgraded carries any amount, for as long as it lives.
 """
 import base64
 import hashlib
@@ -35,4 +38,23 @@ accept = base64.b64encode(hashlib.sha1(key + GUID).digest())
 good = accept in reply
 sock.sendall(b"hello through the proxy")
 echoed = sock.recv(4096).decode(errors="replace")
-print(f"{status} | accept={'ok' if good else 'bad'} | echo={echoed}")
+carried = ""
+if len(sys.argv) > 3:
+    # One piece at a time, each read back before the next is sent.
+    piece, left, back = os.urandom(32768), int(sys.argv[3]), 0
+    try:
+        while left:
+            sent = piece[: min(left, len(piece))]
+            sock.sendall(sent)
+            got = b""
+            while len(got) < len(sent):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError
+                got += chunk
+            back += len(got) if got == sent else 0
+            left -= len(sent)
+    except OSError:
+        pass
+    carried = f" | carried={back}"
+print(f"{status} | accept={'ok' if good else 'bad'} | echo={echoed}{carried}")

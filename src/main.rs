@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{error, info};
+use pingora::apps::HttpServerOptions;
+use pingora::listeners::TcpSocketOptions;
 use pingora::listeners::tls::TlsSettings;
+use pingora::protocols::TcpKeepalive;
 use pingora::proxy::http_proxy_service;
 use pingora::server::configuration::ServerConf;
 use pingora::server::{Server, ShutdownWatch};
@@ -110,6 +113,24 @@ impl BackgroundService for Drain {
     }
 }
 
+/// For every accepted connection: have the kernel check that a quiet client
+/// is still there. One that vanished without closing (a phone that left the
+/// network, a NAT that forgot the connection) is found within two minutes and
+/// dropped, where the idle timeout does not reach: a request or a WebSocket
+/// that is open but silent.
+fn socket_options() -> TcpSocketOptions {
+    let mut options = TcpSocketOptions::default();
+    options.tcp_keepalive = Some(TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        count: 6,
+        // The system default.
+        #[cfg(target_os = "linux")]
+        user_timeout: Duration::ZERO,
+    });
+    options
+}
+
 fn run(config: Config) -> Result<(), BoxError> {
     let store = Arc::new(CertStore::new());
     let challenges = Arc::new(ChallengeStore::default());
@@ -175,18 +196,30 @@ fn run(config: Config) -> Result<(), BoxError> {
         &server.configuration,
         proxy::Gateway::new(&config, sites, challenges, in_flight.clone()),
     );
-    service.add_tcp(&config.http_addr.to_string());
+    // An HTTP/2 connection with no request on it is closed after the same
+    // time as an idle HTTP/1.1 one, which the gateway sees to per request.
+    let mut options = HttpServerOptions::default();
+    options.h2_idle_timeout = config.timeouts.client_idle;
+    service
+        .app_logic_mut()
+        .expect("a new service has its application")
+        .server_options = Some(options);
+    service.add_tcp_with_settings(&config.http_addr.to_string(), socket_options());
     info!("listening for HTTP on {}", config.http_addr);
 
     if config.tls != TlsMode::Off {
         // The paths are unused: every certificate comes from the resolver.
         let mut tls = TlsSettings::intermediate("", "")?;
         tls.set_cert_resolver(store);
-        tls.enable_h2();
-        service.add_tls_with_settings(&config.https_addr.to_string(), None, tls);
+        if config.http2 {
+            tls.enable_h2();
+        }
+        service.add_tls_with_settings(&config.https_addr.to_string(), Some(socket_options()), tls);
         info!(
-            "listening for HTTPS on {} ({:?})",
-            config.https_addr, config.tls
+            "listening for HTTPS on {} ({:?}{})",
+            config.https_addr,
+            config.tls,
+            if config.http2 { "" } else { ", HTTP/1.1 only" }
         );
     }
     for route in &config.routes {

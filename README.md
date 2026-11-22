@@ -48,6 +48,7 @@ wins. Requests for a host with no route get a 404.
 | `STRIP_PREFIX` | `true` removes the path prefix before forwarding. Default `false`. |
 | `SET_HOST` | Replaces the `Host` header sent upstream. By default the client's is kept. |
 | `READ_TIMEOUT` | How long to wait for the upstream to send (response headers, then each piece of the body). Overrides `PINGENV_UPSTREAM_READ_TIMEOUT` for this route; `0` means no limit. |
+| `MAX_BODY_SIZE` | The largest request body this route accepts, instead of `PINGENV_MAX_BODY_SIZE`: `50MiB` for the one application that takes uploads, say. `0` means no limit. |
 
 ### Serving files
 
@@ -154,6 +155,7 @@ one starts from the new variables. What that costs depends on what is replaced:
 | `PINGENV_TLS_MODE` | `off` | `off`: HTTP only. `acme`: certificates from an ACME CA. `selfsigned`: generated at startup, for local use. `manual`: every host has `TLS_CERT_FILE` and `TLS_KEY_FILE` on one of its routes. In every mode, a host with files uses them. |
 | `PINGENV_HTTP_ADDR` | `0.0.0.0:80` | Plain HTTP listener. |
 | `PINGENV_HTTPS_ADDR` | `0.0.0.0:443` | HTTPS listener (HTTP/1.1 and HTTP/2), unless TLS is off. |
+| `PINGENV_HTTP2` | `true` | `false` stops offering HTTP/2 on the HTTPS listener, so every client speaks HTTP/1.1: the switch to reach for when an HTTP/2 vulnerability is announced and the fix is not out yet. |
 | `PINGENV_HTTPS_REDIRECT` | `true` with TLS | Redirect HTTP requests for known hosts to HTTPS (308). |
 | `PINGENV_HTTPS_REDIRECT_PORT` | `443` | Port used in the redirect, if HTTPS is published on another one. |
 | `PINGENV_DATA_DIR` | `/data` | Where the ACME account and certificates are stored. |
@@ -162,9 +164,11 @@ one starts from the new variables. What that costs depends on what is replaced:
 | `PINGENV_ACME_DIRECTORY_URL` | Let's Encrypt | Any other ACME CA. |
 | `PINGENV_ACME_CA_FILE` | none | Extra root to trust when talking to the ACME server (private or test CAs). |
 | `PINGENV_MEMORY_MAX_TOTAL` | `128MiB` | Cap on file bytes held in memory across all routes, compressed copies included, kept for the life of the process. Exceeding it at startup is an error; a copy that no longer fits when it is refreshed is dropped and served from disk. |
+| `PINGENV_MAX_BODY_SIZE` | `1MiB` | The largest request body accepted, on every route that does not set its own `MAX_BODY_SIZE`. A larger one is answered with a 413 and not passed on: before the upstream is asked when the request says how long it is, cut off at the limit when it does not. A WebSocket is not a request body and carries any amount. `0` for no limit. |
 | `PINGENV_UPSTREAM_CONNECT_TIMEOUT` | `10s` | Time allowed to open a connection to an upstream. `0` for no limit. |
 | `PINGENV_UPSTREAM_READ_TIMEOUT` | `60s` | Time an upstream may stay silent while sending a response. Streaming responses that pause longer need a route-level `READ_TIMEOUT`. |
 | `PINGENV_WRITE_TIMEOUT` | `60s` | Time a client, or an upstream, may take to accept data that is being sent to it. |
+| `PINGENV_IDLE_TIMEOUT` | `75s` | How long a client connection is kept open with no request on it, HTTP/1.1 keep-alive and HTTP/2 alike. A client cannot ask for longer. Counted in whole seconds; `0` for no limit. |
 | `PINGENV_HSTS` | none | `Strict-Transport-Security` value, like `max-age=31536000`, sent on every HTTPS response: from upstreams, from files, and pingenv's own redirects and errors (a 404, a 502 for an upstream that is down). Browsers remember it, so start small. |
 | `PINGENV_CERT_RELOAD_INTERVAL` | `60s` | How often `TLS_CERT_FILE` / `TLS_KEY_FILE` are checked for changes. |
 | `PINGENV_THREADS` | CPU count | Worker threads. |
@@ -199,11 +203,13 @@ HTTP-01 challenge. Using this mode means you accept the CA's terms of service.
 
 ## Behaviour worth knowing
 
-- `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` (the client's
-  `Host`, port included) and `X-Forwarded-Port` are **overwritten**, not
-  appended to. `Forwarded`, `X-Real-IP` and `X-Forwarded-Server` are
-  **removed**: pingenv assumes it is the edge. Don't put it behind another
-  proxy if your app relies on those.
+- `X-Forwarded-For`, `X-Real-IP` (both the address of the client that
+  connected), `X-Forwarded-Proto`, `X-Forwarded-Host` (the client's `Host`,
+  port included) and `X-Forwarded-Port` are **overwritten**, not appended to.
+  `Forwarded` and `X-Forwarded-Server` are **removed**: pingenv assumes it is
+  the edge. Don't put it behind another proxy if your app relies on those.
+  An IPv4 client is always given as an IPv4 address, also on a listener bound
+  to `[::]`, where it arrives as `::ffff:192.0.2.1`.
 - Before routing, escapes of letters, digits, `-`, `_` and `~` are decoded, so
   `/%61pi` is `/api` for matching and for the upstream. Other escapes, `%2F`
   and `%2e` included, are left as sent.
@@ -217,10 +223,16 @@ HTTP-01 challenge. Using this mode means you accept the CA's terms of service.
   WebSockets opened over HTTP/2 (RFC 8441) are not supported. The upstream
   read timeout applies to the handshake; whether it applies to an upgraded
   connection that stays quiet has not been tested.
-- There is no limit on connections or request rate, and no overall time limit
-  on a request: a client that trickles bytes slowly enough to stay inside the
-  60 second read timeout is not cut off. Put a rate limiter or a CDN in front
-  if that matters.
+- Clients are held to a few limits. A connection with no request on it is
+  closed after `PINGENV_IDLE_TIMEOUT`. A client that goes silent while sending
+  a request, or before sending one at all, is dropped after about a minute. One
+  that vanished without closing is noticed by TCP keepalive within two
+  minutes, also in the middle of a WebSocket. A request body larger than
+  `PINGENV_MAX_BODY_SIZE` never reaches an upstream.
+- There is still no limit on the number of connections or on the request
+  rate, and no overall time limit on a request: a client that trickles bytes
+  slowly enough to stay inside the 60 second read timeout is not cut off. Put
+  a rate limiter or a CDN in front if that matters.
 - Upstream names are re-resolved every 10 seconds, so a container that returns
   with a new address is picked up. One lookup serves all the requests waiting
   on it. A resolver that is slow or failing does not hold up an upstream whose
@@ -262,7 +274,8 @@ directory listings, metrics.
 ```sh
 cargo test                          # unit tests
 tests/e2e.sh                        # real binary: routing, files, compression, WebSockets,
-                                    # timeouts, shutdown, certificate reload, self-signed TLS
+                                    # timeouts, limits, shutdown, certificate reload,
+                                    # self-signed TLS
                                     # (needs python3, openssl, curl)
 tests/e2e.sh --acme <pebble-dir>    # plus a real ACME issuance against Pebble
 ```

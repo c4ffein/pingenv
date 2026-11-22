@@ -92,6 +92,8 @@ pub struct Route {
     pub acme_passthrough: bool,
     /// `Some(None)` disables the upstream read timeout for this route.
     pub read_timeout: Option<Option<Duration>>,
+    /// Overrides the global limit on request bodies; `Some(None)` lifts it.
+    pub max_body_size: Option<Option<u64>>,
 }
 
 /// `None` means no limit.
@@ -100,6 +102,8 @@ pub struct Timeouts {
     pub upstream_connect: Option<Duration>,
     pub upstream_read: Option<Duration>,
     pub write: Option<Duration>,
+    /// How long a client connection may stay open with no request on it.
+    pub client_idle: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,8 @@ pub struct Config {
     pub http_addr: SocketAddr,
     pub https_addr: SocketAddr,
     pub tls: TlsMode,
+    /// Offer HTTP/2 on the HTTPS listener.
+    pub http2: bool,
     pub https_redirect: bool,
     /// Port used in redirect `Location` headers; differs from the listen port
     /// when the container port is published on another one.
@@ -124,6 +130,9 @@ pub struct Config {
     pub routes: Vec<Route>,
     /// Upper bound on file bytes held in memory across all routes.
     pub memory_max_total: u64,
+    /// Largest request body accepted, unless a route sets its own. `None`
+    /// means no limit.
+    pub max_body_size: Option<u64>,
     pub timeouts: Timeouts,
     /// `Strict-Transport-Security` value, sent on HTTPS responses.
     pub hsts: Option<String>,
@@ -140,6 +149,7 @@ const GLOBALS: &[&str] = &[
     "TLS_MODE",
     "HTTP_ADDR",
     "HTTPS_ADDR",
+    "HTTP2",
     "HTTPS_REDIRECT",
     "HTTPS_REDIRECT_PORT",
     "DATA_DIR",
@@ -148,9 +158,11 @@ const GLOBALS: &[&str] = &[
     "ACME_DIRECTORY_URL",
     "ACME_CA_FILE",
     "MEMORY_MAX_TOTAL",
+    "MAX_BODY_SIZE",
     "UPSTREAM_CONNECT_TIMEOUT",
     "UPSTREAM_READ_TIMEOUT",
     "WRITE_TIMEOUT",
+    "IDLE_TIMEOUT",
     "HSTS",
     "CERT_RELOAD_INTERVAL",
     "THREADS",
@@ -162,6 +174,7 @@ const GLOBALS: &[&str] = &[
 /// `HTTPS_REDIRECT` are in the same position and have their own messages.
 const TLS_ONLY: &[&str] = &[
     "HTTPS_ADDR",
+    "HTTP2",
     "HTTPS_REDIRECT_PORT",
     "DATA_DIR",
     "ACME_EMAIL",
@@ -176,6 +189,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "MEMORY_PATHS",
     "MEMORY_REFRESH",
     "ACME_PASSTHROUGH",
+    "MAX_BODY_SIZE",
     "READ_TIMEOUT",
     "CACHE_CONTROL",
     "COMPRESS",
@@ -197,6 +211,12 @@ const DEFAULT_MEMORY_REFRESH: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Long enough for a browser to reuse the connection for its next click,
+/// short enough that connections nobody uses do not pile up.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Enough for forms and API calls. An application that takes uploads says so,
+/// on its route.
+const DEFAULT_MAX_BODY_SIZE: u64 = 1024 * 1024;
 const DEFAULT_CERT_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_MEMORY_MAX_TOTAL: u64 = 128 * 1024 * 1024;
 const DEFAULT_CACHE_CONTROL: &str = "no-cache";
@@ -274,6 +294,7 @@ impl Config {
             get("HTTPS_ADDR"),
             "0.0.0.0:443",
         );
+        let http2 = parse_bool(&mut errors, "PINGENV_HTTP2", get("HTTP2"), true);
         let https_redirect = parse_bool(
             &mut errors,
             "PINGENV_HTTPS_REDIRECT",
@@ -345,6 +366,13 @@ impl Config {
                 0
             }),
         };
+        let max_body_size = match get("MAX_BODY_SIZE") {
+            None => Some(DEFAULT_MAX_BODY_SIZE),
+            Some(v) => parse_limit(&v).unwrap_or_else(|why| {
+                errors.push(format!("PINGENV_MAX_BODY_SIZE: '{v}' {why}"));
+                None
+            }),
+        };
 
         let timeouts = Timeouts {
             upstream_connect: parse_timeout(
@@ -364,6 +392,12 @@ impl Config {
                 "PINGENV_WRITE_TIMEOUT",
                 get("WRITE_TIMEOUT"),
                 DEFAULT_WRITE_TIMEOUT,
+            ),
+            client_idle: parse_timeout(
+                &mut errors,
+                "PINGENV_IDLE_TIMEOUT",
+                get("IDLE_TIMEOUT"),
+                DEFAULT_IDLE_TIMEOUT,
             ),
         };
         let hsts = get("HSTS");
@@ -482,6 +516,7 @@ impl Config {
             http_addr,
             https_addr,
             tls,
+            http2,
             https_redirect,
             https_redirect_port,
             data_dir: PathBuf::from(get("DATA_DIR").unwrap_or_else(|| "/data".into())),
@@ -492,6 +527,7 @@ impl Config {
             },
             routes,
             memory_max_total,
+            max_body_size,
             timeouts,
             hsts,
             cert_reload_interval,
@@ -661,6 +697,12 @@ fn parse_route(
             None
         })
     });
+    let max_body_size = field("MAX_BODY_SIZE").map(|v| {
+        parse_limit(v).unwrap_or_else(|why| {
+            errors.push(format!("{}: '{v}' {why}", var("MAX_BODY_SIZE")));
+            None
+        })
+    });
 
     let site = match field("ROOT") {
         Some(root) => {
@@ -670,7 +712,7 @@ fn parse_route(
                     var("ROOT")
                 ));
             }
-            for upstream_only in ["STRIP_PREFIX", "SET_HOST", "READ_TIMEOUT"] {
+            for upstream_only in ["STRIP_PREFIX", "SET_HOST", "READ_TIMEOUT", "MAX_BODY_SIZE"] {
                 if field(upstream_only).is_some() {
                     errors.push(format!(
                         "{}: only applies to routes with an upstream",
@@ -771,6 +813,7 @@ fn parse_route(
         cert_files,
         acme_passthrough,
         read_timeout,
+        max_body_size,
     })
 }
 
@@ -796,6 +839,11 @@ pub fn parse_size(text: &str) -> Result<u64, &'static str> {
         .ok()
         .and_then(|n| n.checked_mul(factor))
         .ok_or("is not a size like 0, 65536, 512KiB or 2MiB")
+}
+
+/// A size used as a limit: zero means "no limit" and comes back as `None`.
+pub fn parse_limit(text: &str) -> Result<Option<u64>, &'static str> {
+    parse_size(text).map(|bytes| (bytes > 0).then_some(bytes))
 }
 
 /// A duration like `250ms`, `30s`, `5m`, `2h`; a bare number is seconds. Zero
@@ -1186,6 +1234,7 @@ mod tests {
             ),
             ("PINGENV_ACME_CA_FILE", "/ca.pem"),
             ("PINGENV_HTTPS_ADDR", "0.0.0.0:8443"),
+            ("PINGENV_HTTP2", "false"),
             ("PINGENV_HTTPS_REDIRECT_PORT", "8443"),
             ("PINGENV_DATA_DIR", "/var/lib/pingenv"),
             ("PINGENV_CERT_RELOAD_INTERVAL", "30s"),
@@ -1334,29 +1383,56 @@ mod tests {
         assert_eq!(cfg.timeouts.upstream_connect, Some(Duration::from_secs(10)));
         assert_eq!(cfg.timeouts.upstream_read, Some(Duration::from_secs(60)));
         assert_eq!(cfg.timeouts.write, Some(Duration::from_secs(60)));
+        assert_eq!(cfg.timeouts.client_idle, Some(Duration::from_secs(75)));
+        assert_eq!(cfg.max_body_size, Some(1024 * 1024));
+        assert!(cfg.http2);
         assert_eq!(cfg.hsts, None);
         assert!(!cfg.routes[0].acme_passthrough);
         assert_eq!(cfg.routes[0].read_timeout, None);
+        assert_eq!(cfg.routes[0].max_body_size, None);
 
         let cfg = env(&[
             ("PINGENV_TLS_MODE", "selfsigned"),
             ("PINGENV_UPSTREAM_READ_TIMEOUT", "5s"),
             ("PINGENV_WRITE_TIMEOUT", "0"),
+            ("PINGENV_IDLE_TIMEOUT", "30s"),
+            ("PINGENV_MAX_BODY_SIZE", "64KiB"),
+            ("PINGENV_HTTP2", "false"),
             ("PINGENV_HSTS", "max-age=31536000; includeSubDomains"),
             ("PINGENV_ROUTE_A_HOST", "a.test"),
             ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
             ("PINGENV_ROUTE_A_READ_TIMEOUT", "0"),
+            ("PINGENV_ROUTE_A_MAX_BODY_SIZE", "0"),
             ("PINGENV_ROUTE_A_ACME_PASSTHROUGH", "true"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_MAX_BODY_SIZE", "50MiB"),
         ])
         .unwrap();
         assert_eq!(cfg.timeouts.upstream_read, Some(Duration::from_secs(5)));
         assert_eq!(cfg.timeouts.write, None);
+        assert_eq!(cfg.timeouts.client_idle, Some(Duration::from_secs(30)));
+        assert_eq!(cfg.max_body_size, Some(64 * 1024));
+        assert!(!cfg.http2);
+        // Zero lifts the limit, on a route as everywhere else.
+        assert_eq!(cfg.routes[0].max_body_size, Some(None));
+        assert_eq!(cfg.routes[1].max_body_size, Some(Some(50 << 20)));
         assert_eq!(
             cfg.hsts.as_deref(),
             Some("max-age=31536000; includeSubDomains")
         );
         assert_eq!(cfg.routes[0].read_timeout, Some(None));
         assert!(cfg.routes[0].acme_passthrough);
+
+        let cfg = env(&[
+            ("PINGENV_IDLE_TIMEOUT", "0"),
+            ("PINGENV_MAX_BODY_SIZE", "0"),
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.timeouts.client_idle, None);
+        assert_eq!(cfg.max_body_size, None);
 
         let errs = env(&[
             ("PINGENV_HSTS", "max-age=1"),
@@ -1372,6 +1448,9 @@ mod tests {
             ("PINGENV_ROUTE_A_HOST", "a.test"),
             ("PINGENV_ROUTE_A_ROOT", "/srv"),
             ("PINGENV_ROUTE_A_READ_TIMEOUT", "5"),
+            ("PINGENV_ROUTE_A_MAX_BODY_SIZE", "5MiB"),
+            ("PINGENV_MAX_BODY_SIZE", "big"),
+            ("PINGENV_IDLE_TIMEOUT", "soon"),
         ])
         .unwrap_err()
         .join("\n");
@@ -1381,6 +1460,19 @@ mod tests {
         );
         assert!(
             errs.contains("PINGENV_ROUTE_A_READ_TIMEOUT: only applies"),
+            "{errs}"
+        );
+        // Files are only ever read with GET and HEAD: there is no body to limit.
+        assert!(
+            errs.contains("PINGENV_ROUTE_A_MAX_BODY_SIZE: only applies"),
+            "{errs}"
+        );
+        assert!(
+            errs.contains("PINGENV_MAX_BODY_SIZE: 'big' is not a size"),
+            "{errs}"
+        );
+        assert!(
+            errs.contains("PINGENV_IDLE_TIMEOUT: 'soon' is not a duration"),
             "{errs}"
         );
     }
@@ -1427,5 +1519,9 @@ mod tests {
         assert!(parse_size("lots").is_err());
         assert!(parse_size("-1").is_err());
         assert!(parse_size("99999999999999GiB").is_err());
+
+        assert_eq!(parse_limit("0"), Ok(None));
+        assert_eq!(parse_limit("1MiB"), Ok(Some(1 << 20)));
+        assert!(parse_limit("lots").is_err());
     }
 }
