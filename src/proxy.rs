@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use crate::acme::{CHALLENGE_PREFIX, ChallengeStore};
 use crate::config::{Config, Route, Timeouts, Upstream};
 use crate::files::{self, Site};
+use crate::limit::RateLimiter;
 
 /// Upstream names are re-resolved this often, so a container that comes back
 /// with a new address is picked up without restarting the proxy.
@@ -373,6 +374,8 @@ pub struct Gateway {
     router: Router,
     /// One entry per route; `Some` for routes that serve files.
     sites: Vec<Option<Site>>,
+    /// One entry per route; `Some` for routes with a rate limit.
+    limiters: Vec<Option<RateLimiter>>,
     counters: Vec<AtomicUsize>,
     resolver: Resolver,
     challenges: Arc<ChallengeStore>,
@@ -396,6 +399,11 @@ impl Gateway {
         Self {
             in_flight,
             sites,
+            limiters: config
+                .routes
+                .iter()
+                .map(|route| route.rate_limit.map(RateLimiter::new))
+                .collect(),
             counters: config.routes.iter().map(|_| AtomicUsize::new(0)).collect(),
             router: Router::new(config.routes.clone()),
             resolver: Resolver::default(),
@@ -459,6 +467,12 @@ fn declared_length(req: &RequestHeader) -> Option<u64> {
 fn client_ip(session: &Session) -> Option<IpAddr> {
     let addr = session.client_addr()?.as_inet()?;
     Some(addr.ip().to_canonical())
+}
+
+/// Whether a body follows the request header, of whatever length.
+fn carries_body(req: &RequestHeader) -> bool {
+    declared_length(req).is_some_and(|length| length > 0)
+        || req.headers.contains_key(http::header::TRANSFER_ENCODING)
 }
 
 fn is_tls(session: &Session) -> bool {
@@ -586,8 +600,27 @@ impl ProxyHttp for Gateway {
             return Ok(true);
         }
 
+        // Before the route does any work for the request, and for every
+        // request on it: one that is only redirected counts as well. The
+        // CA's own requests are left alone.
+        if let Some(limiter) = &self.limiters[route]
+            && !passthrough
+            && let Some(ip) = client_ip(session)
+            && let Err(wait) = limiter.check(ip, Instant::now())
+        {
+            ctx.host = host;
+            if carries_body(req) {
+                // Not read, so the connection cannot serve another request.
+                session.set_keepalive(None);
+            }
+            let seconds = wait.as_secs_f64().ceil().max(1.0) as u64;
+            let retry_after = [("Retry-After", seconds.to_string())];
+            respond(session, 429, &retry_after, "too many requests\n", hsts).await?;
+            return Ok(true);
+        }
+
+        let target = req.uri.path_and_query().map_or("/", |pq| pq.as_str());
         if !tls && self.https_redirect && !passthrough {
-            let target = req.uri.path_and_query().map_or("/", |pq| pq.as_str());
             let location = match self.https_redirect_port {
                 443 => format!("https://{host}{target}"),
                 port => format!("https://{host}:{port}{target}"),
@@ -597,6 +630,17 @@ impl ProxyHttp for Gateway {
             return Ok(true);
         }
         ctx.host = host;
+
+        if let Some(redirect) = &self.router.routes[route].redirect {
+            let location = match redirect.keep_path {
+                true => format!("{}{target}", redirect.to),
+                false => redirect.to.clone(),
+            };
+            ctx.upstream = Some("redirect".to_string());
+            let location = [("Location", location)];
+            respond(session, redirect.status, &location, "", hsts).await?;
+            return Ok(true);
+        }
 
         if let Some(site) = &self.sites[route] {
             let prefix = &self.router.routes[route].path;
@@ -820,6 +864,8 @@ mod tests {
             acme_passthrough: false,
             read_timeout: None,
             max_body_size: None,
+            redirect: None,
+            rate_limit: None,
         }
     }
 

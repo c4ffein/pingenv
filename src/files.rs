@@ -280,7 +280,38 @@ pub struct Site {
     started: Instant,
     fallback: Option<String>,
     cache_control: String,
+    immutable: Vec<String>,
     compress: bool,
+}
+
+/// For a file that will never change under its name: a browser that has it
+/// does not ask again, not even to check, for a year.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// Whether `path` is what `pattern` describes, where `*` stands for any run
+/// of characters, slashes included, and everything else for itself.
+fn matches(pattern: &str, path: &str) -> bool {
+    let (pattern, path) = (pattern.as_bytes(), path.as_bytes());
+    let (mut p, mut t) = (0, 0);
+    // Where to pick up again when what followed the last `*` did not fit:
+    // let that `*` take one more character and retry from there.
+    let mut retry: Option<(usize, usize)> = None;
+    while t < path.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            retry = Some((p + 1, t));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == path[t] {
+            p += 1;
+            t += 1;
+        } else if let Some((after_star, taken)) = retry {
+            retry = Some((after_star, taken + 1));
+            p = after_star;
+            t = taken + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 impl Site {
@@ -322,8 +353,18 @@ impl Site {
             started,
             fallback: config.fallback.clone(),
             cache_control: config.cache_control.clone(),
+            immutable: config.immutable.clone(),
             compress: config.compress,
         })
+    }
+
+    /// `key` is the URL path, below the root, of the file that is sent: for
+    /// a request answered with the fallback, the fallback's.
+    fn cache_control(&self, key: &str) -> &str {
+        match self.immutable.iter().any(|pattern| matches(pattern, key)) {
+            true => IMMUTABLE,
+            false => &self.cache_control,
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -885,6 +926,7 @@ pub async fn serve(
     };
 
     let meta = found.meta();
+    let cache_control = site.cache_control(&key).to_string();
     let varies = site.negotiable(&meta);
     let accepts = Accepts::parse(header(session, http::header::ACCEPT_ENCODING).as_deref());
     // From here on lengths, ranges and the tag are those of what is sent,
@@ -903,7 +945,7 @@ pub async fn serve(
     let common = |resp: &mut ResponseHeader| -> Result<()> {
         resp.insert_header("ETag", &etag)?;
         resp.insert_header("Last-Modified", meta.last_modified())?;
-        resp.insert_header("Cache-Control", &site.cache_control)?;
+        resp.insert_header("Cache-Control", &cache_control)?;
         if varies {
             // Also on the uncompressed answer: a cache has to know that
             // another client may be owed a different one.
@@ -1009,6 +1051,29 @@ pub async fn serve(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_star_stands_for_any_run_of_characters() {
+        for (pattern, path, expected) in [
+            ("/main-*.js", "/main-4f9a1c.js", true),
+            ("/main-*.js", "/main-.js", true),
+            ("/main-*.js", "/main-4f9a1c.js.map", false),
+            ("/main-*.js", "/docs/main-4f9a1c.js", false),
+            ("*/main-*.js", "/docs/main-4f9a1c.js", true),
+            ("/assets/*", "/assets/img/logo.svg", true),
+            ("/assets/*", "/assets", false),
+            ("*.woff2", "/fonts/inter.woff2", true),
+            ("*.woff2", "/fonts/inter.woff", false),
+            ("/a*b*c", "/a-b-b-c", true),
+            ("/a*b*c", "/a-c-b", false),
+            ("*", "/anything/at/all", true),
+            ("/exact.txt", "/exact.txt", true),
+            ("/exact.txt", "/exact.txt2", false),
+            ("/exact.txt", "/exact.tx", false),
+        ] {
+            assert_eq!(matches(pattern, path), expected, "{pattern} on {path}");
+        }
+    }
+
     fn clean(raw: &str) -> Option<(Vec<&'static str>, bool)> {
         clean_path(raw).map(|(segments, slash)| {
             let leaked: Vec<&'static str> = segments
@@ -1112,6 +1177,7 @@ mod tests {
             memory_refresh: refresh,
             fallback: None,
             cache_control: "no-cache".into(),
+            immutable: Vec::new(),
             compress: true,
         }
     }

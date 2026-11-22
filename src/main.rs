@@ -2,6 +2,7 @@ mod acme;
 mod certs;
 mod config;
 mod files;
+mod limit;
 mod proxy;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
@@ -226,6 +227,9 @@ fn run(config: Config) -> Result<(), BoxError> {
         let mut upstreams: Vec<String> = route.upstreams.iter().map(|u| u.authority()).collect();
         if let Some(site) = &route.site {
             upstreams.push(format!("files in {}", site.root.display()));
+        }
+        if let Some(redirect) = &route.redirect {
+            upstreams.push(format!("{} to {}", redirect.status, redirect.to));
         }
         info!(
             "route {}: {}{} -> {}",

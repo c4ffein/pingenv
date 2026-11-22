@@ -28,7 +28,7 @@ bad configuration prints every problem at once and exits with status 2.
 
 A route is a group of variables sharing a name:
 `PINGENV_ROUTE_<NAME>_<SETTING>`. Names use `A-Z`, `0-9` and `_`, and only
-show up in logs. Each route either proxies to an upstream or serves files.
+show up in logs. Each route proxies to an upstream, serves files, or redirects.
 
 | `PINGENV_ROUTE_<NAME>_…` | Meaning |
 |---|---|
@@ -36,6 +36,8 @@ show up in logs. Each route either proxies to an upstream or serves files.
 | `PATH` | Path prefix, default `/`. `/api` matches `/api` and `/api/x`, not `/apix`. |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | PEM certificate chain and key for this route's hosts, instead of ACME. A certificate belongs to a host, not to a route: naming the files on one route is enough for a host that several routes share, and naming different files for the same host is an error. Re-read when the files change (see `PINGENV_CERT_RELOAD_INTERVAL`). |
 | `ACME_PASSTHROUGH` | `true` lets `/.well-known/acme-challenge/` requests that pingenv has no answer for reach this route's upstream or files, with no HTTPS redirect. For an upstream that runs its own ACME client (certbot, say), paired with `TLS_CERT_FILE`. Default `false`. |
+| `RATE_LIMIT` | How many requests one client may make on this route: `10/s`, `600/m` or `1000/h`. One over is answered with a 429 and a `Retry-After`, and the upstream is not asked. Default: no limit. See "Rate limits" below. |
+| `RATE_BURST` | With `RATE_LIMIT`: how many requests a client may make at once before the rate applies. Default: the number in the limit, so `10/s` lets 10 through at once and `600/m` lets 600. |
 
 An exact host beats a wildcard, and within a host the longest path prefix
 wins. Requests for a host with no route get a 404.
@@ -50,6 +52,17 @@ wins. Requests for a host with no route get a 404.
 | `READ_TIMEOUT` | How long to wait for the upstream to send (response headers, then each piece of the body). Overrides `PINGENV_UPSTREAM_READ_TIMEOUT` for this route; `0` means no limit. |
 | `MAX_BODY_SIZE` | The largest request body this route accepts, instead of `PINGENV_MAX_BODY_SIZE`: `50MiB` for the one application that takes uploads, say. `0` means no limit. |
 
+### Redirecting
+
+| `PINGENV_ROUTE_<NAME>_…` | Meaning |
+|---|---|
+| `REDIRECT` | A full URL. Every request on the route is answered with a redirect to it, whatever its path: `https://github.com/you/project` for a domain that only points somewhere else. |
+| `REDIRECT_KEEP_PATH` | `true` adds the path and query of the request to the URL, which then is a site rather than a page: `https://example.com` on the route for `www.example.com` sends `/a?b=1` to `https://example.com/a?b=1`. Default `false`. |
+| `REDIRECT_STATUS` | `301`, `302`, `307` or `308`. Default `302`: browsers ask again next time, so a wrong target is not remembered. Go permanent (`301`, or `308` to keep the method) once it is right. |
+
+The host of such a route gets a certificate like any other, and a request over
+plain HTTP is sent to HTTPS first.
+
 ### Serving files
 
 | `PINGENV_ROUTE_<NAME>_…` | Meaning |
@@ -60,6 +73,7 @@ wins. Requests for a host with no route get a 404.
 | `MEMORY_REFRESH` | How long a copy in memory is trusted before the file is checked again; if it changed it is reloaded, and if it is gone or grew past the limit it is dropped. Default `5m`; `0` never checks (a startup snapshot). |
 | `FALLBACK` | File served when nothing matches, for single-page apps, e.g. `/index.html`. Only applies to paths whose last segment has no dot, so a missing `/app.js` is still a 404. |
 | `CACHE_CONTROL` | `Cache-Control` header for this route. Default `no-cache` (browsers revalidate, and get a cheap 304). |
+| `IMMUTABLE` | Files whose content never changes under the same name, like the hashed bundles of a build. Patterns for the path below `ROOT`, comma separated, where `*` stands for any run of characters: `/assets/*,/main-*.js,*.woff2`. They are sent with `Cache-Control: public, max-age=31536000, immutable` instead of `CACHE_CONTROL`, so a browser that has one does not ask again. |
 | `COMPRESS` | `false` sends every file as it is. Default `true`: see "Compression" below. |
 
 Sizes are a number of bytes, or use `KiB`/`MiB`/`GiB` (or `KB`/`MB`/`GB`).
@@ -288,10 +302,20 @@ HTTP-01 challenge. Using this mode means you accept the CA's terms of service.
   that vanished without closing is noticed by TCP keepalive within two
   minutes, also in the middle of a WebSocket. A request body larger than
   `PINGENV_MAX_BODY_SIZE` never reaches an upstream.
-- There is still no limit on the number of connections or on the request
-  rate, and no overall time limit on a request: a client that trickles bytes
-  slowly enough to stay inside the 60 second read timeout is not cut off. Put
-  a rate limiter or a CDN in front if that matters.
+- **Rate limits** (`RATE_LIMIT` on a route) count requests per client, and a
+  client is the address pingenv sees: an IPv4 address, or the /64 an IPv6
+  address is in, since one customer can use any address of theirs. Each
+  client has an allowance of `RATE_BURST` requests that refills at the rate;
+  a request that finds it empty gets a 429 and is not counted. The count is
+  kept per route and in memory: it starts again when the process does, and
+  past 100,000 clients on a route at once the newest are let through rather
+  than held in ever more memory. Clients that share an address share an
+  allowance: an office behind one address, or every IPv6 visitor when
+  Docker's proxy forwards them over IPv4 (a network without IPv6).
+- There is still no limit on the number of connections, and no overall time
+  limit on a request: a client that trickles bytes slowly enough to stay
+  inside the 60 second read timeout is not cut off. Put a CDN in front if
+  that matters.
 - Upstream names are re-resolved every 10 seconds, so a container that returns
   with a new address is picked up. One lookup serves all the requests waiting
   on it. A resolver that is slow or failing does not hold up an upstream whose
@@ -324,9 +348,9 @@ HTTP-01 challenge. Using this mode means you accept the CA's terms of service.
 
 DNS-01 and wildcard issuance, multiple replicas sharing certificates, config
 reload without restart (see "Changing the configuration"), active upstream
-health checks, rate limiting, response caching, compressing while a client
-waits (files on disk without a precompressed copy, responses from upstreams),
-directory listings, metrics.
+health checks, a limit on the number of connections, response caching,
+compressing while a client waits (files on disk without a precompressed copy,
+responses from upstreams), directory listings, metrics.
 
 ## Development
 

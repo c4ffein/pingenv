@@ -65,10 +65,33 @@ pub struct StaticSite {
     /// Served for paths that match no file, for single-page applications.
     pub fallback: Option<String>,
     pub cache_control: String,
+    /// Patterns (`*` stands for any run of characters) for files whose
+    /// content never changes under the same name, like a build's hashed
+    /// bundles. Matched against the URL path below the root.
+    pub immutable: Vec<String>,
     /// Send text compressed to clients that accept it: a gzip copy of files
     /// held in memory, and precompressed `.br` / `.gz` copies found next to
     /// a file.
     pub compress: bool,
+}
+
+/// An answer that is the same for every request on the route: go elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    /// A full URL, without a trailing slash when the path is kept.
+    pub to: String,
+    pub status: u16,
+    /// Append the path and query of the request to `to`.
+    pub keep_path: bool,
+}
+
+/// How many requests one client may make on a route.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateLimit {
+    /// Requests per second, sustained.
+    pub per_second: f64,
+    /// Requests that may come at once, before the rate applies.
+    pub burst: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -81,9 +104,12 @@ pub struct Route {
     /// (except for the root itself).
     pub path: String,
     pub strip_prefix: bool,
-    /// Empty when the route serves files.
+    /// Empty when the route serves files or redirects.
     pub upstreams: Vec<Upstream>,
     pub site: Option<StaticSite>,
+    pub redirect: Option<Redirect>,
+    /// Per client address; `None` means no limit.
+    pub rate_limit: Option<RateLimit>,
     /// Overrides the `Host` header sent to the upstream.
     pub set_host: Option<String>,
     pub cert_files: Option<CertFiles>,
@@ -185,6 +211,8 @@ const TLS_ONLY: &[&str] = &[
 ];
 
 const ROUTE_FIELDS: &[&str] = &[
+    "REDIRECT_KEEP_PATH",
+    "REDIRECT_STATUS",
     "MEMORY_MAX_FILE",
     "MEMORY_PATHS",
     "MEMORY_REFRESH",
@@ -196,6 +224,10 @@ const ROUTE_FIELDS: &[&str] = &[
     "TLS_CERT_FILE",
     "TLS_KEY_FILE",
     "STRIP_PREFIX",
+    "RATE_LIMIT",
+    "RATE_BURST",
+    "IMMUTABLE",
+    "REDIRECT",
     "SET_HOST",
     "UPSTREAM",
     "FALLBACK",
@@ -220,6 +252,11 @@ const DEFAULT_MAX_BODY_SIZE: u64 = 1024 * 1024;
 const DEFAULT_CERT_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_MEMORY_MAX_TOTAL: u64 = 128 * 1024 * 1024;
 const DEFAULT_CACHE_CONTROL: &str = "no-cache";
+/// Temporary: a browser asks again next time, so a mistake in the target is
+/// not remembered. A permanent one is a setting away.
+const DEFAULT_REDIRECT_STATUS: u16 = 302;
+/// Settings that mean something only where requests are passed on.
+const UPSTREAM_ONLY: &[&str] = &["STRIP_PREFIX", "SET_HOST", "READ_TIMEOUT", "MAX_BODY_SIZE"];
 
 impl Config {
     pub fn from_env<I>(vars: I) -> Result<Config, Vec<String>>
@@ -455,8 +492,9 @@ impl Config {
         }
         if raw_routes.is_empty() {
             errors.push(
-                "no routes configured: set PINGENV_ROUTE_<NAME>_HOST and either \
-                 PINGENV_ROUTE_<NAME>_UPSTREAM or PINGENV_ROUTE_<NAME>_ROOT"
+                "no routes configured: set PINGENV_ROUTE_<NAME>_HOST and one of \
+                 PINGENV_ROUTE_<NAME>_UPSTREAM, PINGENV_ROUTE_<NAME>_ROOT or \
+                 PINGENV_ROUTE_<NAME>_REDIRECT"
                     .into(),
             );
         }
@@ -627,19 +665,30 @@ fn parse_route(
         }
     }
 
+    // What the route does with a request: exactly one of these.
+    let kinds: Vec<String> = ["UPSTREAM", "ROOT", "REDIRECT"]
+        .into_iter()
+        .filter(|kind| field(kind).is_some())
+        .map(&var)
+        .collect();
+    match kinds.len() {
+        0 => errors.push(format!(
+            "{}, {} or {}: one of them is required",
+            var("UPSTREAM"),
+            var("ROOT"),
+            var("REDIRECT")
+        )),
+        1 => {}
+        _ => errors.push(format!(
+            "{}: a route proxies, serves files or redirects: one of the three",
+            kinds.join(" and ")
+        )),
+    }
+
     let mut upstreams = Vec::new();
     match field("UPSTREAM") {
-        None if field("ROOT").is_some() => {}
-        None => errors.push(format!(
-            "{} or {}: one of them is required",
-            var("UPSTREAM"),
-            var("ROOT")
-        )),
-        Some(_) if field("ROOT").is_some() => errors.push(format!(
-            "{} and {}: a route either proxies or serves files, not both",
-            var("UPSTREAM"),
-            var("ROOT")
-        )),
+        _ if kinds.len() != 1 => {}
+        None => {}
         Some(raw) => {
             let listed = entries(raw);
             // Not the same as missing: the variable is set, and a route that
@@ -717,6 +766,91 @@ fn parse_route(
         })
     });
 
+    let redirect = match field("REDIRECT") {
+        Some(to) => {
+            for other in UPSTREAM_ONLY.iter().chain(&["ACME_PASSTHROUGH"]) {
+                if field(other).is_some() {
+                    errors.push(format!(
+                        "{}: does not apply to a route that redirects",
+                        var(other)
+                    ));
+                }
+            }
+            let keep_path = parse_bool(
+                errors,
+                &var("REDIRECT_KEEP_PATH"),
+                field("REDIRECT_KEEP_PATH").cloned(),
+                false,
+            );
+            if let Err(why) = validate_redirect(to, keep_path) {
+                errors.push(format!("{}: '{to}' {why}", var("REDIRECT")));
+            }
+            let status = match field("REDIRECT_STATUS") {
+                None => DEFAULT_REDIRECT_STATUS,
+                Some(v) => match v.parse() {
+                    Ok(status @ (301 | 302 | 307 | 308)) => status,
+                    _ => {
+                        errors.push(format!(
+                            "{}: '{v}' is not one of 301, 302, 307, 308",
+                            var("REDIRECT_STATUS")
+                        ));
+                        DEFAULT_REDIRECT_STATUS
+                    }
+                },
+            };
+            Some(Redirect {
+                // So that the path, which starts with one, can follow.
+                to: match keep_path {
+                    true => to.trim_end_matches('/').to_string(),
+                    false => to.clone(),
+                },
+                status,
+                keep_path,
+            })
+        }
+        None => {
+            for redirect_only in ["REDIRECT_STATUS", "REDIRECT_KEEP_PATH"] {
+                if field(redirect_only).is_some() {
+                    errors.push(format!(
+                        "{}: only applies to routes with a {}",
+                        var(redirect_only),
+                        var("REDIRECT")
+                    ));
+                }
+            }
+            None
+        }
+    };
+
+    let rate = field("RATE_LIMIT").and_then(|v| {
+        parse_rate(v).unwrap_or_else(|why| {
+            errors.push(format!("{}: '{v}' {why}", var("RATE_LIMIT")));
+            None
+        })
+    });
+    let burst = field("RATE_BURST").and_then(|v| match v.parse::<u32>() {
+        Ok(burst) if burst > 0 => Some(burst),
+        _ => {
+            errors.push(format!(
+                "{}: '{v}' is not a number of requests, 1 or more",
+                var("RATE_BURST")
+            ));
+            None
+        }
+    });
+    if field("RATE_BURST").is_some() && field("RATE_LIMIT").is_none() {
+        errors.push(format!(
+            "{}: only applies to routes with a {}",
+            var("RATE_BURST"),
+            var("RATE_LIMIT")
+        ));
+    }
+    let rate_limit = rate.map(|(count, per)| RateLimit {
+        per_second: f64::from(count) / per.as_secs_f64(),
+        // By default, what the limit says can also come all at once.
+        burst: burst.unwrap_or(count),
+    });
+
     let site = match field("ROOT") {
         Some(root) => {
             if !root.starts_with('/') {
@@ -725,7 +859,7 @@ fn parse_route(
                     var("ROOT")
                 ));
             }
-            for upstream_only in ["STRIP_PREFIX", "SET_HOST", "READ_TIMEOUT", "MAX_BODY_SIZE"] {
+            for upstream_only in UPSTREAM_ONLY {
                 if field(upstream_only).is_some() {
                     errors.push(format!(
                         "{}: only applies to routes with an upstream",
@@ -786,6 +920,26 @@ fn parse_route(
                 errors.push(format!("{}: must be printable ASCII", var("CACHE_CONTROL")));
             }
             let compress = parse_bool(errors, &var("COMPRESS"), field("COMPRESS").cloned(), true);
+            let immutable = match field("IMMUTABLE") {
+                None => Vec::new(),
+                Some(raw) => {
+                    let listed = entries(raw);
+                    if listed.is_empty() {
+                        errors.push(format!("{}: '{raw}' lists no pattern", var("IMMUTABLE")));
+                    }
+                    for pattern in &listed {
+                        let anchored = pattern.starts_with('/') || pattern.starts_with('*');
+                        if !anchored || !pattern.chars().all(|c| c.is_ascii_graphic()) {
+                            errors.push(format!(
+                                "{}: '{pattern}' must be a path like /assets/* or \
+                                 *.woff2 (start with / or *, no spaces)",
+                                var("IMMUTABLE")
+                            ));
+                        }
+                    }
+                    listed.into_iter().map(str::to_string).collect()
+                }
+            };
             Some(StaticSite {
                 root: PathBuf::from(root),
                 memory_max_file,
@@ -793,6 +947,7 @@ fn parse_route(
                 memory_refresh,
                 fallback,
                 cache_control,
+                immutable,
                 compress,
             })
         }
@@ -803,6 +958,7 @@ fn parse_route(
                 "MEMORY_PATHS",
                 "MEMORY_REFRESH",
                 "CACHE_CONTROL",
+                "IMMUTABLE",
                 "COMPRESS",
             ] {
                 if field(files_only).is_some() {
@@ -824,6 +980,8 @@ fn parse_route(
         strip_prefix,
         upstreams,
         site,
+        redirect,
+        rate_limit,
         set_host,
         cert_files,
         acme_passthrough,
@@ -869,6 +1027,45 @@ pub fn parse_size(text: &str) -> Result<u64, &'static str> {
 /// A size used as a limit: zero means "no limit" and comes back as `None`.
 pub fn parse_limit(text: &str) -> Result<Option<u64>, &'static str> {
     parse_size(text).map(|bytes| (bytes > 0).then_some(bytes))
+}
+
+/// A rate like `10/s`, `600/m` or `1000/h`: so many requests per second,
+/// minute or hour. A bare `0` means "no limit" and comes back as `None`.
+pub fn parse_rate(text: &str) -> Result<Option<(u32, Duration)>, &'static str> {
+    const WRONG: &str = "is not a rate like 10/s, 600/m or 1000/h (or 0 for no limit)";
+    let text = text.trim();
+    if text == "0" {
+        return Ok(None);
+    }
+    let (count, unit) = text.split_once('/').ok_or(WRONG)?;
+    let per = match unit.trim().to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return Err(WRONG),
+    };
+    match count.trim().parse::<u32>() {
+        Ok(count) if count > 0 => Ok(Some((count, Duration::from_secs(per)))),
+        _ => Err(WRONG),
+    }
+}
+
+/// A redirect target has to be a whole URL: it is sent as it is written.
+fn validate_redirect(to: &str, keep_path: bool) -> Result<(), &'static str> {
+    let rest = to
+        .strip_prefix("https://")
+        .or_else(|| to.strip_prefix("http://"))
+        .ok_or("must be a full URL, starting with https:// or http://")?;
+    if rest.is_empty() || rest.starts_with('/') || !to.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("is not a URL (printable ASCII, no spaces, with a host name)");
+    }
+    if to.parse::<http::Uri>().is_err() {
+        return Err("is not a URL");
+    }
+    if keep_path && (to.contains('?') || to.contains('#')) {
+        return Err("cannot have a query or a fragment when the request's path is kept");
+    }
+    Ok(())
 }
 
 /// A duration like `250ms`, `30s`, `5m`, `2h`; a bare number is seconds. Zero
@@ -1099,7 +1296,8 @@ mod tests {
         );
         assert!(
             all.contains(
-                "PINGENV_ROUTE_B_UPSTREAM or PINGENV_ROUTE_B_ROOT: one of them is required"
+                "PINGENV_ROUTE_B_UPSTREAM, PINGENV_ROUTE_B_ROOT or PINGENV_ROUTE_B_REDIRECT: \
+                 one of them is required"
             ),
             "{all}"
         );
@@ -1324,6 +1522,7 @@ mod tests {
                 memory_refresh: Some(Duration::from_secs(300)),
                 fallback: Some("/index.html".into()),
                 cache_control: "no-cache".into(),
+                immutable: Vec::new(),
                 compress: true,
             })
         );
@@ -1516,7 +1715,13 @@ mod tests {
         ])
         .unwrap_err();
         let all = errs.join("\n");
-        assert!(all.contains("not both"), "{all}");
+        assert!(
+            all.contains(
+                "PINGENV_ROUTE_A_UPSTREAM and PINGENV_ROUTE_A_ROOT: a route proxies, serves \
+                 files or redirects: one of the three"
+            ),
+            "{all}"
+        );
         assert!(all.contains("must be an absolute path"), "{all}");
         assert!(
             all.contains("PINGENV_ROUTE_A_STRIP_PREFIX: only applies"),
@@ -1531,6 +1736,205 @@ mod tests {
             all.contains("PINGENV_ROUTE_B_COMPRESS: only applies"),
             "{all}"
         );
+    }
+
+    #[test]
+    fn a_route_can_redirect() {
+        let cfg = env(&[
+            ("PINGENV_ROUTE_GO_HOST", "go.test"),
+            (
+                "PINGENV_ROUTE_GO_REDIRECT",
+                "https://example.org/elsewhere?x=1",
+            ),
+            ("PINGENV_ROUTE_WWW_HOST", "www.a.test"),
+            ("PINGENV_ROUTE_WWW_REDIRECT", "https://a.test/"),
+            ("PINGENV_ROUTE_WWW_REDIRECT_KEEP_PATH", "true"),
+            ("PINGENV_ROUTE_WWW_REDIRECT_STATUS", "308"),
+        ])
+        .unwrap();
+        let go = &cfg.routes[0];
+        assert!(go.upstreams.is_empty() && go.site.is_none());
+        assert_eq!(
+            go.redirect,
+            Some(Redirect {
+                to: "https://example.org/elsewhere?x=1".into(),
+                status: 302,
+                keep_path: false,
+            })
+        );
+        // The request's path starts with a slash: the target must not end
+        // with one as well.
+        assert_eq!(
+            cfg.routes[1].redirect,
+            Some(Redirect {
+                to: "https://a.test".into(),
+                status: 308,
+                keep_path: true,
+            })
+        );
+        // A name ending in another setting's is read as the longer setting.
+        assert_eq!(cfg.routes[1].name, "www");
+        assert_eq!(cfg.routes[1].path, "/");
+
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_REDIRECT", "example.org"),
+            ("PINGENV_ROUTE_A_REDIRECT_STATUS", "200"),
+            ("PINGENV_ROUTE_A_STRIP_PREFIX", "true"),
+            ("PINGENV_ROUTE_A_FALLBACK", "/index.html"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_REDIRECT", "https://b.example/?next="),
+            ("PINGENV_ROUTE_B_REDIRECT_KEEP_PATH", "true"),
+            ("PINGENV_ROUTE_C_HOST", "c.test"),
+            ("PINGENV_ROUTE_C_REDIRECT", "https://c.example"),
+            ("PINGENV_ROUTE_C_UPSTREAM", "c:1"),
+            ("PINGENV_ROUTE_D_HOST", "d.test"),
+            ("PINGENV_ROUTE_D_UPSTREAM", "d:1"),
+            ("PINGENV_ROUTE_D_REDIRECT_STATUS", "301"),
+            ("PINGENV_ROUTE_E_HOST", "e.test"),
+            ("PINGENV_ROUTE_E_REDIRECT", "https://"),
+        ])
+        .unwrap_err()
+        .join("\n");
+        for expected in [
+            "PINGENV_ROUTE_A_REDIRECT: 'example.org' must be a full URL",
+            "PINGENV_ROUTE_A_REDIRECT_STATUS: '200' is not one of 301, 302, 307, 308",
+            "PINGENV_ROUTE_A_STRIP_PREFIX: does not apply to a route that redirects",
+            "PINGENV_ROUTE_A_FALLBACK: only applies to routes with a PINGENV_ROUTE_A_ROOT",
+            "PINGENV_ROUTE_B_REDIRECT: 'https://b.example/?next=' cannot have a query",
+            "PINGENV_ROUTE_C_UPSTREAM and PINGENV_ROUTE_C_REDIRECT: a route proxies",
+            "PINGENV_ROUTE_D_REDIRECT_STATUS: only applies to routes with a PINGENV_ROUTE_D_REDIRECT",
+            "PINGENV_ROUTE_E_REDIRECT: 'https://' is not a URL",
+        ] {
+            assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
+        }
+    }
+
+    #[test]
+    fn a_route_can_limit_the_rate_of_each_client() {
+        let cfg = env(&[
+            ("PINGENV_ROUTE_API_HOST", "api.test"),
+            ("PINGENV_ROUTE_API_UPSTREAM", "api:1"),
+            ("PINGENV_ROUTE_API_RATE_LIMIT", "10/s"),
+            ("PINGENV_ROUTE_API_RATE_BURST", "20"),
+            ("PINGENV_ROUTE_SITE_HOST", "site.test"),
+            ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_SITE_RATE_LIMIT", "600/m"),
+            ("PINGENV_ROUTE_FREE_HOST", "free.test"),
+            ("PINGENV_ROUTE_FREE_UPSTREAM", "free:1"),
+            ("PINGENV_ROUTE_FREE_RATE_LIMIT", "0"),
+            ("PINGENV_ROUTE_OPEN_HOST", "open.test"),
+            ("PINGENV_ROUTE_OPEN_REDIRECT", "https://example.org"),
+        ])
+        .unwrap();
+        let limit = |name: &str| {
+            cfg.routes
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .rate_limit
+        };
+        assert_eq!(
+            limit("api"),
+            Some(RateLimit {
+                per_second: 10.0,
+                burst: 20
+            })
+        );
+        // Without a burst of its own, what the limit says may come at once.
+        assert_eq!(
+            limit("site"),
+            Some(RateLimit {
+                per_second: 10.0,
+                burst: 600
+            })
+        );
+        assert_eq!(limit("free"), None);
+        assert_eq!(limit("open"), None);
+
+        assert_eq!(
+            parse_rate("1000/h"),
+            Ok(Some((1000, Duration::from_secs(3600))))
+        );
+        assert_eq!(parse_rate(" 5 / S "), Ok(Some((5, Duration::from_secs(1)))));
+        for wrong in ["10", "10/day", "0/s", "-1/s", "ten/s", "/s", ""] {
+            assert!(parse_rate(wrong).is_err(), "{wrong}");
+        }
+
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_ROUTE_A_RATE_LIMIT", "fast"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_RATE_BURST", "20"),
+            ("PINGENV_ROUTE_C_HOST", "c.test"),
+            ("PINGENV_ROUTE_C_UPSTREAM", "c:1"),
+            ("PINGENV_ROUTE_C_RATE_LIMIT", "1/s"),
+            ("PINGENV_ROUTE_C_RATE_BURST", "0"),
+        ])
+        .unwrap_err()
+        .join("\n");
+        for expected in [
+            "PINGENV_ROUTE_A_RATE_LIMIT: 'fast' is not a rate like 10/s",
+            "PINGENV_ROUTE_B_RATE_BURST: only applies to routes with a PINGENV_ROUTE_B_RATE_LIMIT",
+            "PINGENV_ROUTE_C_RATE_BURST: '0' is not a number of requests, 1 or more",
+        ] {
+            assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
+        }
+    }
+
+    #[test]
+    fn files_can_be_marked_as_never_changing() {
+        let cfg = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_ROOT", "/srv/site"),
+            (
+                "PINGENV_ROUTE_A_IMMUTABLE",
+                "/assets/*, *.woff2 ,/main-*.js",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.routes[0].site.as_ref().unwrap().immutable,
+            ["/assets/*", "*.woff2", "/main-*.js"]
+        );
+
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_A_IMMUTABLE", "assets, /with space/*"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_B_IMMUTABLE", ","),
+            ("PINGENV_ROUTE_C_HOST", "c.test"),
+            ("PINGENV_ROUTE_C_UPSTREAM", "c:1"),
+            ("PINGENV_ROUTE_C_IMMUTABLE", "/assets/*"),
+        ])
+        .unwrap_err()
+        .join("\n");
+        for expected in [
+            "PINGENV_ROUTE_A_IMMUTABLE: 'assets' must be a path like",
+            "PINGENV_ROUTE_A_IMMUTABLE: '/with space/*' must be a path like",
+            "PINGENV_ROUTE_B_IMMUTABLE: ',' lists no pattern",
+            "PINGENV_ROUTE_C_IMMUTABLE: only applies to routes with a PINGENV_ROUTE_C_ROOT",
+        ] {
+            assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
+        }
+    }
+
+    #[test]
+    fn no_route_setting_hides_behind_a_shorter_one() {
+        // `ROUTE_X_REDIRECT_KEEP_PATH` ends in `_PATH` too. The first name in
+        // the list that fits wins, so the longer one has to come first.
+        for (i, earlier) in ROUTE_FIELDS.iter().enumerate() {
+            for later in &ROUTE_FIELDS[i + 1..] {
+                assert!(
+                    !later.ends_with(&format!("_{earlier}")),
+                    "{later} is listed after {earlier} and would be read as it"
+                );
+            }
+        }
     }
 
     #[test]

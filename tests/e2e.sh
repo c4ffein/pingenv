@@ -68,7 +68,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test up.pingenv.test idle.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test up.pingenv.test idle.pingenv.test go.pingenv.test www2.pingenv.test lim.pingenv.test tick.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -119,6 +119,8 @@ BIG_SUM="$(sha256sum <"$SITE/big.bin")"
 for _ in $(seq 400); do echo 'function answer() { return 42; }'; done >"$SITE/auto.js"
 cp "$SITE/auto.js" "$SITE/pre.js"
 JS_SUM="$(sha256sum <"$SITE/auto.js")"
+# What a build names after its content, so that the name never means another.
+echo 'console.log("bundle")' >"$SITE/main-4f9a1c.js"
 python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' <"$SITE/pre.js" >"$SITE/pre.js.gz"
 printf 'brotli-stand-in' >"$SITE/pre.js.br"
 
@@ -136,6 +138,7 @@ env -i \
     PINGENV_ROUTE_LB_HOST=lb.pingenv.test PINGENV_ROUTE_LB_UPSTREAM=127.0.0.1:18001,127.0.0.1:18009,127.0.0.1:18002 \
     PINGENV_ROUTE_SITE_HOST=site.pingenv.test PINGENV_ROUTE_SITE_ROOT="$SITE" \
     PINGENV_ROUTE_SITE_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_SITE_FALLBACK=/index.html \
+    PINGENV_ROUTE_SITE_IMMUTABLE='/main-*.js' \
     PINGENV_ROUTE_ASSETS_HOST=app.pingenv.test PINGENV_ROUTE_ASSETS_PATH=/static \
     PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
     PINGENV_ROUTE_LIVE_HOST=live.pingenv.test PINGENV_ROUTE_LIVE_ROOT="$SITE" \
@@ -154,6 +157,12 @@ env -i \
     PINGENV_ROUTE_OWN2_HOST=own.pingenv.test PINGENV_ROUTE_OWN2_PATH=/two PINGENV_ROUTE_OWN2_UPSTREAM=127.0.0.1:18002 \
     PINGENV_ROUTE_GONE_HOST=gone.pingenv.test PINGENV_ROUTE_GONE_UPSTREAM=no-such-name.invalid:80 \
     PINGENV_ROUTE_UP_HOST=up.pingenv.test PINGENV_ROUTE_UP_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_UP_MAX_BODY_SIZE=3MiB \
+    PINGENV_ROUTE_GO_HOST=go.pingenv.test PINGENV_ROUTE_GO_REDIRECT=https://example.org/elsewhere \
+    PINGENV_ROUTE_WWW_HOST=www2.pingenv.test PINGENV_ROUTE_WWW_REDIRECT="https://app.pingenv.test:$HTTPS/" \
+    PINGENV_ROUTE_WWW_REDIRECT_KEEP_PATH=true PINGENV_ROUTE_WWW_REDIRECT_STATUS=301 \
+    PINGENV_ROUTE_LIM_HOST=lim.pingenv.test PINGENV_ROUTE_LIM_UPSTREAM=127.0.0.1:18001 \
+    PINGENV_ROUTE_LIM_RATE_LIMIT=6/m PINGENV_ROUTE_LIM_RATE_BURST=5 \
+    PINGENV_ROUTE_TICK_HOST=tick.pingenv.test PINGENV_ROUTE_TICK_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_TICK_RATE_LIMIT=1/s \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -265,6 +274,12 @@ check "serves the index for /" "$(get -k "$S/")" '<h1>home</h1>'
 check "content type" "$(hdr content-type "$S/css/site.css")" 'text/css; charset=utf-8'
 check "small file comes from memory" "$(src 'site.pingenv.test/css/site.css')" upstream=memory
 check "default Cache-Control" "$(hdr cache-control "$S/css/site.css")" no-cache
+B="$S/main-4f9a1c.js"
+check "a file marked as never changing may be kept for good" \
+    "$(hdr cache-control "$B")" "public, max-age=31536000, immutable"
+check "and says so again when it is only checked" \
+    "$(code -H "If-None-Match: $(hdr etag "$B")" "$B") $(hdr cache-control -H "If-None-Match: $(hdr etag "$B")" "$B")" \
+    "304 public, max-age=31536000, immutable"
 check "large file is intact" "$(get -k "$S/big.bin" | sha256sum)" "$BIG_SUM"
 check "large file is streamed from disk" "$(src 'site.pingenv.test/big.bin')" upstream=disk
 check "large file over HTTP/2 is intact" "$(get -k --http2 "$S/big.bin" | sha256sum)" "$BIG_SUM"
@@ -307,6 +322,8 @@ check "symlink to a hidden directory is refused" "$(code "https://live.pingenv.t
 check "symlink to a hidden file is refused" "$(code "$S/env.txt")" 404
 check "symlink inside the root is served" "$(get -k "$S/inside.css")" 'body{}'
 check "fallback for application routes" "$(get -k "$S/users/42")" '<h1>home</h1>'
+check "the fallback page is checked each time, whatever the path looks like" \
+    "$(hdr cache-control "$S/main-users")" no-cache
 check "no fallback for missing assets" "$(code "$S/missing.js")" 404
 check "POST is refused" "$(code -X POST "$S/")" 405
 
@@ -368,6 +385,34 @@ check "the default window keeps the old copy" "$(get -k "$S/css/site.css")" 'bod
 PA="https://paths.pingenv.test:$HTTPS"
 check "MEMORY_PATHS: a chosen directory is in memory" "$(get -k "$PA/css/site.css" >/dev/null; src 'paths.pingenv.test/css/site.css')" upstream=memory
 check "MEMORY_PATHS: the rest is on disk" "$(get -k "$PA/docs/index.html" >/dev/null; src 'paths.pingenv.test/docs/index.html')" upstream=disk
+
+echo "== redirects"
+check "a route can answer with a redirect, whatever the path" \
+    "$(get -k -o /dev/null -w '%{http_code} %{redirect_url}' "https://go.pingenv.test:$HTTPS/any/path?x=1")" \
+    "302 https://example.org/elsewhere"
+check "or send the same path to another host, with the status it names" \
+    "$(get -k -o /dev/null -w '%{http_code} %{redirect_url}' "https://www2.pingenv.test:$HTTPS/a/b?c=1")" \
+    "301 https://app.pingenv.test:$HTTPS/a/b?c=1"
+check "whatever the method, and the access log says what it was" \
+    "$(code -X POST "https://go.pingenv.test:$HTTPS/") $(sleep 0.2; grep -c 'POST go.pingenv.test/ 302 route=go upstream=redirect ' "$WORK/selfsigned.log")" "302 1"
+check "plain HTTP is sent to HTTPS first, as on any route" \
+    "$(get -o /dev/null -w '%{http_code} %{redirect_url}' "http://go.pingenv.test:$HTTP/x")" "308 https://go.pingenv.test:$HTTPS/x"
+check "HSTS on a redirect" "$(hdr strict-transport-security "https://go.pingenv.test:$HTTPS/")" "max-age=31536000"
+
+echo "== rate limit"
+# Five at once, then one every ten seconds: nothing comes back while this runs.
+R="https://lim.pingenv.test:$HTTPS/"
+CODES=""
+for _ in $(seq 8); do CODES+="$(code "$R") "; done
+check "a burst passes, and what comes after it is refused" "$CODES" "200 200 200 200 200 429 429 429 "
+WAIT="$(hdr retry-after "$R")"
+check "with the time to wait" "$([[ "$WAIT" =~ ^[0-9]+$ ]] && (( WAIT >= 1 && WAIT <= 10 )) && echo yes || echo "no: '$WAIT'")" yes
+check "the upstream is not asked for what is refused" \
+    "$(sleep 0.2; grep -c 'lim.pingenv.test/ 429 route=lim upstream=- ' "$WORK/selfsigned.log") $(grep -c 'lim.pingenv.test/ 200 route=lim upstream=127.0.0.1:18001 ' "$WORK/selfsigned.log")" "4 5"
+check "a limit is the route's own: the others are not held to it" \
+    "$(code "https://app.pingenv.test:$HTTPS/")" 200
+T="https://tick.pingenv.test:$HTTPS/"
+check "the allowance comes back with time" "$(code "$T") $(code "$T") $(sleep 1.2; code "$T")" "200 429 200"
 
 echo "== websocket"
 check "upgrade is proxied and bytes flow both ways" \
