@@ -613,7 +613,11 @@ fn parse_route(
     match field("HOST") {
         None => errors.push(format!("{}: missing", var("HOST"))),
         Some(raw) => {
-            for host in raw.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+            let listed = entries(raw);
+            if listed.is_empty() {
+                errors.push(format!("{}: '{raw}' lists no host name", var("HOST")));
+            }
+            for host in listed {
                 let host = host.to_ascii_lowercase();
                 match validate_host(&host, true) {
                     Ok(()) => hosts.push(host),
@@ -637,7 +641,16 @@ fn parse_route(
             var("ROOT")
         )),
         Some(raw) => {
-            for item in raw.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            let listed = entries(raw);
+            // Not the same as missing: the variable is set, and a route that
+            // got this far with no upstream would have nowhere to send to.
+            if listed.is_empty() {
+                errors.push(format!(
+                    "{}: '{raw}' lists no upstream (expected host:port, comma separated)",
+                    var("UPSTREAM")
+                ));
+            }
+            for item in listed {
                 match parse_upstream(item) {
                     Ok(u) => upstreams.push(u),
                     Err(why) => errors.push(format!("{}: '{item}' {why}", var("UPSTREAM"))),
@@ -737,11 +750,13 @@ fn parse_route(
             let memory_paths = match field("MEMORY_PATHS") {
                 None => vec![String::new()],
                 Some(raw) => {
-                    let listed: Vec<&str> = raw
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|p| !p.is_empty())
-                        .collect();
+                    let listed = entries(raw);
+                    if listed.is_empty() {
+                        errors.push(format!(
+                            "{}: '{raw}' lists no path (leave it unset for everything)",
+                            var("MEMORY_PATHS")
+                        ));
+                    }
                     if listed.iter().any(|p| !p.starts_with('/')) {
                         errors.push(format!(
                             "{}: every path must start with /",
@@ -815,6 +830,16 @@ fn parse_route(
         read_timeout,
         max_body_size,
     })
+}
+
+/// The entries of a comma separated setting. Empty ones are dropped, so a
+/// stray comma does no harm; a value that is nothing but commas comes back
+/// empty, which the caller reports: it is set, and yet it lists nothing.
+fn entries(raw: &str) -> Vec<&str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
 }
 
 /// Parses a byte count: a bare number, or one with a `KiB`/`MiB`/`GiB`
@@ -1506,6 +1531,45 @@ mod tests {
             all.contains("PINGENV_ROUTE_B_COMPRESS: only applies"),
             "{all}"
         );
+    }
+
+    #[test]
+    fn a_list_of_nothing_but_commas_is_an_error() {
+        // Set, so not "missing", and yet it lists nothing. A route that
+        // started with no upstream had nowhere to send its requests.
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_UPSTREAM", ","),
+            ("PINGENV_ROUTE_B_HOST", " , "),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_C_HOST", "c.test"),
+            ("PINGENV_ROUTE_C_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_C_MEMORY_PATHS", ",,"),
+        ])
+        .unwrap_err();
+        let all = errs.join("\n");
+        assert!(
+            all.contains("PINGENV_ROUTE_A_UPSTREAM: ',' lists no upstream"),
+            "{all}"
+        );
+        assert!(
+            all.contains("PINGENV_ROUTE_B_HOST: ',' lists no host name"),
+            "{all}"
+        );
+        assert!(
+            all.contains("PINGENV_ROUTE_C_MEMORY_PATHS: ',,' lists no path"),
+            "{all}"
+        );
+        assert_eq!(errs.len(), 3, "{all}");
+
+        // A stray comma among real entries is still only a stray comma.
+        let cfg = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test,"),
+            ("PINGENV_ROUTE_A_UPSTREAM", ",a:1,,b:2"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.routes[0].hosts, ["a.test"]);
+        assert_eq!(cfg.routes[0].upstreams.len(), 2);
     }
 
     #[test]
