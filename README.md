@@ -140,13 +140,72 @@ one starts from the new variables. What that costs depends on what is replaced:
   connection on the next upstream, so a swap shows up as at most a few
   failed requests.
 - **The edge itself:** a gap of a second or two while the new container binds
-  the ports. On `SIGTERM` the listeners close at once and the process exits as
-  soon as the requests in flight are done: immediately if there are none, and
-  after `PINGENV_SHUTDOWN_GRACE_SECONDS` at the latest, which cuts off whatever
-  is still running (a WebSocket, a long download). Certificates survive if
-  `PINGENV_DATA_DIR` is a volume.
+  the ports, unless the swap is made in front of the containers (see
+  "Replacing the edge without a gap" below). On `SIGTERM` the listeners close
+  at once and the process exits as soon as the requests in flight are done:
+  immediately if there are none, and after `PINGENV_SHUTDOWN_GRACE_SECONDS` at
+  the latest, which cuts off whatever is still running (a WebSocket, a long
+  download). Certificates survive if `PINGENV_DATA_DIR` is a volume.
 - **Certificate files** (`TLS_CERT_FILE`) are the exception: they are re-read
   when they change, so renewing them needs no recreate.
+
+### Replacing the edge without a gap
+
+The gap is the time between the old container letting go of ports 80 and 443
+and the new one holding them. Docker cannot close it: a published port belongs
+to one container for as long as that container exists. A redirect on the host
+can, in front of both containers, for the length of the swap:
+
+1. **Start the new configuration as a temporary container:** another name, the
+   same networks, volumes and variables, and its ports published on spare host
+   ports (Docker only lets traffic from outside reach published ports).
+2. **Redirect ports 80 and 443 to it.** With nftables: both ports in one
+   transaction, in a table of its own whose chain runs before Docker's, and to
+   the container's address rather than to its host ports, which keeps the
+   clients' addresses. Connections that are open stay with the old container;
+   new ones go to the temporary one.
+3. **Stop and remove the old container.** It finishes the requests in flight.
+4. **Create the final container,** with the usual name and ports 80 and 443
+   published. No traffic reaches it yet: the redirect still wins.
+5. **Remove the redirect.** New connections reach the final container through
+   Docker's own rule; those on the temporary one stay there.
+6. **Stop and remove the temporary container.**
+
+It ends as it began, with one container and no rule of your own, and at every
+step a container is serving: if the final one does not start, the temporary
+one still is.
+
+pingenv's part in this is what the end-to-end test covers: it finishes the
+requests in flight before it exits, and an instance started on a data
+directory that already holds the certificates serves them and asks the CA for
+nothing. The firewall's part is the host's and is **not tested here**: try it
+on a spare port before trusting it with 80 and 443.
+
+Worth knowing:
+
+- **The redirect comes off before the container it points at** (steps 5 and 6,
+  in that order). Left behind, pointing at a container that is gone, it is an
+  outage: ports 80 and 443 lead nowhere.
+- **Long-lived connections are cut twice,** at steps 3 and 6. A WebSocket gets
+  `PINGENV_SHUTDOWN_GRACE_SECONDS` each time and then has to reconnect.
+- **A host name that is new in this configuration** has no certificate yet,
+  and every instance asks for one as it starts. The CA checks over port 80 and
+  reaches whichever instance has the port at that moment, but only the one
+  that asked knows the answer. A request that fails this way is retried 15
+  minutes later, with a self-signed placeholder until then. So do step 2 as
+  soon as the temporary container listens, and wait for its `certificate
+  issued` line before step 3: it comes at once if the redirect was there in
+  time for the CA's check, 15 minutes later if not. The final container then
+  finds the certificate in the data directory.
+- **The instances share the data directory** during the swap. That is fine for
+  the seconds it lasts; it is not a way to run two of them for good (see "Not
+  included").
+- **IPv6** clients need the same redirect in the `ip6` family, if the host
+  names have AAAA records.
+- **Without Docker's port publishing** (host networking, or no container at
+  all) there is nothing to redirect, and two instances cannot listen on one
+  port at once. Start the new one anyway: it waits up to 30 seconds for the
+  port and takes it when the old one exits, a gap of a second at most.
 
 ## Global settings
 
