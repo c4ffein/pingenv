@@ -133,9 +133,36 @@ ssh box 'cd /srv/www/site && mv .incoming/*.js .incoming/*.css . &&
          mv .incoming/* . && rmdir .incoming'
 ```
 
-Either way, what is held in memory follows at the next `MEMORY_REFRESH` pass,
-the page and its bundles in the same step: the old page with the old bundles
-until then, the new page with the new ones after.
+**What memory changes about this, and what it does not.** Memory is a cache
+of the files it holds; a file it does not hold is read from disk. So a file
+that is in the directory is never missing from what is served, whatever a
+refresh has or has not seen yet. And what a refresh sees is not one instant of
+the directory: it lists it, then looks at each file, then reads the ones that
+are new or changed, while a deploy may be going on. The cases:
+
+- **A file added since the last pass, or missed by one that was under way:**
+  read from disk, whole if it was renamed into place. It gets its compressed
+  copy when a pass loads it.
+- **The new bundles seen, the new page not yet:** the old page is served, with
+  its old bundles, which are still there.
+- **A file deleted, or replaced under the same name:** the copy in memory is
+  served until the next pass, so for `MEMORY_REFRESH` at most. A script that
+  keeps its name from one build to the next can therefore be out of step with
+  the page for that long. Hashed names are what rules it out: a name that only
+  ever stands for one content cannot be out of step with anything.
+- **A file copied straight to its final name and caught half written:** held
+  as it was caught, and served that way, until the next pass. Rename instead.
+- **A `ROOT` that is a symbolic link** is followed once, at startup. Pointing
+  the link at another directory later changes nothing until a restart.
+- **A directory that cannot be read** when a pass comes by: memory is left as
+  it is.
+
+The bundles of a previous build are deleted sooner or later, and a page left
+open for longer than that will ask for one that is gone. The complete answer
+is in the application: reload when a script fails to load, once and not in a
+loop. It works here because the page is sent with `no-cache` by default, so
+the reload gets the new one, and because a script that is missing is answered
+with a 404, never with the fallback page.
 
 **Compression happens once per file, never once per request.** Text (HTML,
 CSS, JavaScript, JSON, SVG, WebAssembly and the like) is sent compressed to
