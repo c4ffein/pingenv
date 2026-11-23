@@ -70,7 +70,7 @@ plain HTTP is sent to HTTPS first.
 | `ROOT` | Absolute path of the directory to serve. The route's path prefix maps onto it: with `PATH=/docs`, `/docs/a.css` is `ROOT/a.css`. |
 | `MEMORY_MAX_FILE` | Files up to this size are held in memory; larger ones are streamed from disk. Default `0`: everything is served from disk, and the operating system's page cache keeps hot files fast. |
 | `MEMORY_PATHS` | With `MEMORY_MAX_FILE` set: which files and directories, below `ROOT`, may be held in memory. Comma separated, like `/index.html,/assets`. Default `/`: everything. |
-| `MEMORY_REFRESH` | How long a copy in memory is trusted before the file is checked again; if it changed it is reloaded, and if it is gone or grew past the limit it is dropped. Default `5m`; `0` never checks (a startup snapshot). |
+| `MEMORY_REFRESH` | How often the directory is read again and memory brought in line with it: new files are loaded, changed ones loaded again, deleted ones dropped. Default `5m`; `0` never looks again (a startup snapshot). |
 | `FALLBACK` | File served when nothing matches, for single-page apps, e.g. `/index.html`. Only applies to paths whose last segment has no dot, so a missing `/app.js` is still a 404. |
 | `CACHE_CONTROL` | `Cache-Control` header for this route. Default `no-cache` (browsers revalidate, and get a cheap 304). |
 | `IMMUTABLE` | Files whose content never changes under the same name, like the hashed bundles of a build. Patterns for the path below `ROOT`, comma separated, where `*` stands for any run of characters: `/assets/*,/main-*.js,*.woff2`. They are sent with `Cache-Control: public, max-age=31536000, immutable` instead of `CACHE_CONTROL`, so a browser that has one does not ask again. |
@@ -81,12 +81,23 @@ Durations are seconds, or use `ms`/`s`/`m`/`h`: `30`, `500ms`, `5m`.
 
 **Memory is opt-in.** The files chosen by `MEMORY_MAX_FILE` and `MEMORY_PATHS`
 are loaded at startup and counted against `PINGENV_MEMORY_MAX_TOTAL`, so a
-directory bigger than expected fails at startup, not under load. Each copy is
-checked against its file at most once per `MEMORY_REFRESH` window: an edit shows
-up within that window, a deleted file stops being served. Files that were not
-loaded (too large, outside `MEMORY_PATHS`, or added later) are always read from
-disk. Set `MEMORY_REFRESH=0` for a frozen snapshot, which suits a site baked
-into an image.
+directory bigger than expected fails at startup, not under load. After that
+the directory is read again every `MEMORY_REFRESH`, in the background, and
+memory is brought in line with it in one step: what a deploy edited, added,
+moved or deleted shows up together, within that time, and a request for a file
+held in memory never waits for the disk. A file is recognised as changed by
+its size and its modification time. Files that are not held (too large,
+outside `MEMORY_PATHS`, added since the last pass, or more than
+`PINGENV_MEMORY_MAX_TOTAL` has room for) are read from disk. Set
+`MEMORY_REFRESH=0` for a frozen snapshot, which suits a site baked into an
+image.
+
+Memory follows the directory; it cannot make a deploy atomic. While files are
+being copied in, a request may find a new page with old scripts, or a file
+half written, and with `IMMUTABLE` a browser keeps what it got. Copy in a way
+that puts whole files in place at the end: `rsync -a --delay-updates
+--delete-delay` does, and its temporary files are hidden ones, which are never
+served.
 
 **Compression happens once per file, never once per request.** Text (HTML,
 CSS, JavaScript, JSON, SVG, WebAssembly and the like) is sent compressed to
@@ -236,7 +247,7 @@ Worth knowing:
 | `PINGENV_ACME_STAGING` | `false` | Use Let's Encrypt's staging CA (untrusted certificates, generous limits). |
 | `PINGENV_ACME_DIRECTORY_URL` | Let's Encrypt | Any other ACME CA. |
 | `PINGENV_ACME_CA_FILE` | none | Extra root to trust when talking to the ACME server (private or test CAs). |
-| `PINGENV_MEMORY_MAX_TOTAL` | `128MiB` | Cap on file bytes held in memory across all routes, compressed copies included, kept for the life of the process. Exceeding it at startup is an error; a copy that no longer fits when it is refreshed is dropped and served from disk. |
+| `PINGENV_MEMORY_MAX_TOTAL` | `128MiB` | Cap on file bytes held in memory across all routes, compressed copies included, kept for the life of the process. Exceeding it at startup is an error; later, a file that is new or has grown and no longer fits is served from disk, and the log says how many are. |
 | `PINGENV_MAX_BODY_SIZE` | `1MiB` | The largest request body accepted, on every route that does not set its own `MAX_BODY_SIZE`. A larger one is answered with a 413 and not passed on: before the upstream is asked when the request says how long it is, cut off at the limit when it does not. A WebSocket is not a request body and carries any amount. `0` for no limit. |
 | `PINGENV_UPSTREAM_CONNECT_TIMEOUT` | `10s` | Time allowed to open a connection to an upstream. `0` for no limit. |
 | `PINGENV_UPSTREAM_READ_TIMEOUT` | `60s` | Time an upstream may stay silent while sending a response. Streaming responses that pause longer need a route-level `READ_TIMEOUT`. |

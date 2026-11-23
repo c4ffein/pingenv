@@ -3,10 +3,12 @@
 //! Files are streamed from disk by default: the operating system keeps hot
 //! files in its page cache, so a second copy in this process buys little. A
 //! route can opt in to holding small files in memory. Those copies are loaded
-//! at startup, trusted for a refresh window (five minutes by default), then
-//! checked against the file again, and reloaded or dropped if it changed.
-//! Anything not in memory (too large, outside the chosen paths, added later,
-//! or no longer matching) is read from disk on each request.
+//! at startup, and once per refresh window (five minutes by default) the
+//! directory is walked again and memory brought in line with it: new files
+//! are loaded, changed ones loaded again, deleted ones dropped. A request
+//! for a file held in memory never touches the disk. Anything not in memory
+//! (too large, outside the chosen paths, added since the last walk, or more
+//! than there is room for) is read from disk on each request.
 //!
 //! Text is sent compressed to clients that can read it, without compressing
 //! anything twice: a file held in memory is gzipped once when it is loaded,
@@ -16,19 +18,22 @@
 //! There are no directory listings. Dotfiles are never served (so a stray
 //! `.env` or `.git` cannot leak), with the exception of `.well-known`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use log::info;
+use log::{info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
+use pingora::server::ShutdownWatch;
+use pingora::services::background::BackgroundService;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::certs::BoxError;
@@ -199,6 +204,10 @@ impl MemoryBudget {
     fn give_back(&self, bytes: u64) {
         self.used.fetch_sub(bytes, Ordering::AcqRel);
     }
+
+    fn room(&self) -> u64 {
+        self.max.saturating_sub(self.used.load(Ordering::Acquire))
+    }
 }
 
 struct MemFile {
@@ -207,11 +216,6 @@ struct MemFile {
     /// The same content compressed, settled when the file was loaded: read
     /// from a precompressed copy next to it, or (gzip only) made here.
     encoded: Vec<(Coding, Bytes)>,
-    /// Where it was read from, to check it again.
-    path: PathBuf,
-    /// When it was last known to match the disk, in milliseconds since the
-    /// site was loaded.
-    checked: AtomicU64,
 }
 
 impl MemFile {
@@ -270,18 +274,18 @@ enum Lookup {
 }
 
 pub struct Site {
+    /// The route's name, for the log.
+    route: String,
     /// Canonical, so that symlinks pointing outside it can be detected.
     root: PathBuf,
-    /// Keyed by URL path below the root, like `/css/site.css`.
+    /// Keyed by URL path below the root, like `/css/site.css`. Written at
+    /// startup and by `refresh`, and by nothing else.
     memory: RwLock<HashMap<String, Arc<MemFile>>>,
-    memory_max_file: u64,
-    memory_refresh: Option<Duration>,
     budget: Arc<MemoryBudget>,
-    started: Instant,
-    fallback: Option<String>,
-    cache_control: String,
-    immutable: Vec<String>,
-    compress: bool,
+    config: StaticSite,
+    /// How many files the last refresh found no room for, so that it is
+    /// said when that changes and not at every pass.
+    left_on_disk: AtomicUsize,
 }
 
 /// For a file that will never change under its name: a browser that has it
@@ -329,11 +333,31 @@ impl Site {
             return Err(format!("route {route}: {} is not a directory", root.display()).into());
         }
 
-        let started = Instant::now();
         let mut memory = HashMap::new();
+        let mut found = Vec::new();
         if config.memory_max_file > 0 {
-            snapshot(&root, "", config, &budget, &mut memory)
-                .map_err(|e| format!("route {route}: {e}"))?;
+            candidates(&root, "", config, &mut found).map_err(|e| format!("route {route}: {e}"))?;
+        }
+        for Candidate {
+            key,
+            path,
+            metadata,
+        } in found
+        {
+            let body = std::fs::read(&path)
+                .map_err(|e| format!("route {route}: {}: {e}", path.display()))?;
+            let file = mem_file(&path, &metadata, body, config.compress);
+            if !budget.try_take(file.cost()) {
+                return Err(format!(
+                    "route {route}: files to hold in memory, with their compressed copies, \
+                     exceed PINGENV_MEMORY_MAX_TOTAL ({} bytes); raise it, narrow \
+                     PINGENV_ROUTE_<NAME>_MEMORY_PATHS, or lower \
+                     PINGENV_ROUTE_<NAME>_MEMORY_MAX_FILE (0 serves from disk)",
+                    budget.max
+                )
+                .into());
+            }
+            memory.insert(key, Arc::new(file));
         }
         let bytes: u64 = memory.values().map(|f: &Arc<MemFile>| f.cost()).sum();
         let copies = memory.values().filter(|f| !f.encoded.is_empty()).count();
@@ -345,112 +369,142 @@ impl Site {
         );
 
         Ok(Site {
+            route: route.to_string(),
             root,
             memory: RwLock::new(memory),
-            memory_max_file: config.memory_max_file,
-            memory_refresh: config.memory_refresh,
             budget,
-            started,
-            fallback: config.fallback.clone(),
-            cache_control: config.cache_control.clone(),
-            immutable: config.immutable.clone(),
-            compress: config.compress,
+            config: config.clone(),
+            left_on_disk: AtomicUsize::new(0),
         })
     }
 
     /// `key` is the URL path, below the root, of the file that is sent: for
     /// a request answered with the fallback, the fallback's.
     fn cache_control(&self, key: &str) -> &str {
-        match self.immutable.iter().any(|pattern| matches(pattern, key)) {
+        let immutable = &self.config.immutable;
+        match immutable.iter().any(|pattern| matches(pattern, key)) {
             true => IMMUTABLE,
-            false => &self.cache_control,
+            false => &self.config.cache_control,
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+    /// How often memory is brought in line with the directory. `None` when
+    /// nothing is held, or when what is held is a snapshot taken at startup.
+    fn refresh_every(&self) -> Option<Duration> {
+        let holds = self.config.memory_max_file > 0;
+        self.config.memory_refresh.filter(|_| holds)
     }
 
-    fn is_fresh(&self, file: &MemFile) -> bool {
-        match self.memory_refresh {
-            None => true,
-            Some(window) => {
-                let age = self
-                    .now_ms()
-                    .saturating_sub(file.checked.load(Ordering::Relaxed));
-                age < window.as_millis() as u64
+    /// Brings what is held in memory in line with the directory: files that
+    /// are new are loaded, files that changed are loaded again, and those
+    /// that are gone, or may no longer be held, are dropped. Requests see
+    /// all of it happen at once, so a site that was replaced as a whole is
+    /// never served half old and half new from here.
+    ///
+    /// This reads and compresses files: not for a thread that serves requests.
+    fn refresh(&self) {
+        let mut found = Vec::new();
+        if let Err(e) = candidates(&self.root, "", &self.config, &mut found) {
+            // A directory that cannot be read just now says nothing about
+            // what is in it: better the files of a moment ago than none.
+            warn!(
+                "route {}: files in memory left as they are: {e}",
+                self.route
+            );
+            return;
+        }
+        let held: HashMap<String, (Meta, u64)> = {
+            let memory = self.memory.read().unwrap();
+            let entry =
+                |(key, file): (&String, &Arc<MemFile>)| (key.clone(), (file.meta, file.cost()));
+            memory.iter().map(entry).collect()
+        };
+
+        // First what stays as it is, which costs one look at each file.
+        let mut unchanged = HashSet::new();
+        let mut to_load = Vec::new();
+        for candidate in found {
+            let now = Meta::new(&candidate.path, &candidate.metadata);
+            match held.get(&candidate.key) {
+                Some((was, _)) if was.modified == now.modified && was.len == now.len => {
+                    unchanged.insert(candidate.key);
+                }
+                _ => to_load.push(candidate),
             }
+        }
+        // Then what has to be read. Not what could not fit anyway: it would
+        // be read, compressed and turned away again at every pass.
+        let leaving = held.iter().filter(|(key, _)| !unchanged.contains(*key));
+        let freed: u64 = leaving.map(|(_, (_, cost))| cost).sum();
+        let mut room = self.budget.room().saturating_add(freed);
+        let mut no_room = 0;
+        let mut loaded = Vec::new();
+        for Candidate {
+            key,
+            path,
+            metadata,
+        } in to_load
+        {
+            if metadata.len() > room {
+                no_room += 1;
+                continue;
+            }
+            // Gone since the directory was listed: as if it had not been.
+            let Ok(body) = std::fs::read(&path) else {
+                continue;
+            };
+            let file = mem_file(&path, &metadata, body, self.config.compress);
+            room = room.saturating_sub(file.cost());
+            loaded.push((key, file));
+        }
+
+        let (mut added, mut reloaded) = (0, 0);
+        let replaced = loaded.iter().filter(|(key, _)| held.contains_key(key));
+        let gone = held.len() - unchanged.len() - replaced.count();
+        {
+            let mut memory = self.memory.write().unwrap();
+            // What leaves goes first, so that its room is there for what
+            // arrives.
+            memory.retain(|key, file| {
+                let stays = unchanged.contains(key);
+                if !stays {
+                    self.budget.give_back(file.cost());
+                }
+                stays
+            });
+            for (key, file) in loaded {
+                // Another route may have taken the room in the meantime.
+                if !self.budget.try_take(file.cost()) {
+                    no_room += 1;
+                    continue;
+                }
+                match held.contains_key(&key) {
+                    true => reloaded += 1,
+                    false => added += 1,
+                }
+                memory.insert(key, Arc::new(file));
+            }
+        }
+
+        let before = self.left_on_disk.swap(no_room, Ordering::Relaxed);
+        if added + reloaded + gone > 0 || no_room != before {
+            let left = match no_room {
+                0 => String::new(),
+                n => format!("; {n} left on disk, PINGENV_MEMORY_MAX_TOTAL has no room for them"),
+            };
+            info!(
+                "route {}: files in memory brought up to date: {added} new, {reloaded} changed, \
+                 {gone} gone{left}",
+                self.route
+            );
         }
     }
 
     async fn find(&self, key: &str) -> Option<Found> {
-        let cached = self.memory.read().unwrap().get(key).cloned();
-        if let Some(file) = cached {
-            if self.is_fresh(&file) {
-                return Some(Found::Memory(file));
-            }
-            if let Some(found) = self.revalidate(key, file).await {
-                return Some(found);
-            }
-            // Gone, replaced or no longer fitting: the disk has the answer.
-        }
-        self.find_on_disk(key).await
-    }
-
-    /// Checks a memory copy whose window ran out against the file. `None`
-    /// means the copy was dropped.
-    async fn revalidate(&self, key: &str, file: Arc<MemFile>) -> Option<Found> {
-        // Not `metadata`: a file swapped for a symlink must go back through
-        // the checks in `find_on_disk`.
-        let metadata = tokio::fs::symlink_metadata(&file.path).await.ok();
-        let Some(metadata) = metadata.filter(|m| m.is_file()) else {
-            self.swap(key, &file, None);
-            return None;
-        };
-        let now = Meta::new(&file.path, &metadata);
-        if now.modified == file.meta.modified && now.len == file.meta.len {
-            file.checked.store(self.now_ms(), Ordering::Relaxed);
-            return Some(Found::Memory(file));
-        }
-        if metadata.len() <= self.memory_max_file {
-            let (path, compress, checked) = (file.path.clone(), self.compress, self.now_ms());
-            // Off this thread: there is a file to read and maybe to compress.
-            let load = tokio::task::spawn_blocking(move || {
-                let body = std::fs::read(&path).ok()?;
-                Some(mem_file(&path, &metadata, body, checked, compress))
-            });
-            if let Ok(Some(fresh)) = load.await {
-                let fresh = Arc::new(fresh);
-                if self.swap(key, &file, Some(fresh.clone())) {
-                    return Some(Found::Memory(fresh));
-                }
-                return None;
-            }
-        }
-        self.swap(key, &file, None);
-        None
-    }
-
-    /// Replaces `old` with `new` (or removes it) unless someone else already
-    /// did. Returns whether `new` is now in place.
-    fn swap(&self, key: &str, old: &Arc<MemFile>, new: Option<Arc<MemFile>>) -> bool {
-        let mut memory = self.memory.write().unwrap();
-        if !memory
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, old))
-        {
-            return false;
-        }
-        self.budget.give_back(old.cost());
-        match new {
-            Some(new) if self.budget.try_take(new.cost()) => {
-                memory.insert(key.to_string(), new);
-                true
-            }
-            _ => {
-                memory.remove(key);
-                false
-            }
+        let held = self.memory.read().unwrap().get(key).cloned();
+        match held {
+            Some(file) => Some(Found::Memory(file)),
+            None => self.find_on_disk(key).await,
         }
     }
 
@@ -493,7 +547,7 @@ impl Site {
 
     /// Whether the answer for this file depends on what the client accepts.
     fn negotiable(&self, meta: &Meta) -> bool {
-        self.compress && compressible(meta.content_type)
+        self.config.compress && compressible(meta.content_type)
     }
 
     /// Picks what to send for the file found at `key`: the smallest
@@ -539,13 +593,7 @@ impl Site {
 
 /// A file to hold in memory, with its compressed copies if `compress` is set
 /// and it is the kind of file that shrinks.
-fn mem_file(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    body: Vec<u8>,
-    checked: u64,
-    compress: bool,
-) -> MemFile {
+fn mem_file(path: &Path, metadata: &std::fs::Metadata, body: Vec<u8>, compress: bool) -> MemFile {
     // The length is taken from what was read, not from the earlier stat, so
     // Content-Length always matches the body.
     let meta = Meta {
@@ -568,8 +616,6 @@ fn mem_file(
         meta,
         body: Bytes::from(body),
         encoded,
-        path: path.to_path_buf(),
-        checked: AtomicU64::new(checked),
     }
 }
 
@@ -646,15 +692,27 @@ fn wanted(paths: &[String], key: &str, is_dir: bool) -> bool {
     })
 }
 
-fn snapshot(
+/// A file that may be held in memory, as a walk of the directory found it.
+struct Candidate {
+    /// Its URL path below the root.
+    key: String,
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+/// Walks `dir` for the files that the route's settings let into memory.
+/// Nothing is read: this is the list, for whoever loads them. A directory
+/// that cannot be listed is an error; an entry that went away while the walk
+/// was on is simply not in the list.
+fn candidates(
     dir: &Path,
     url: &str,
     config: &StaticSite,
-    budget: &MemoryBudget,
-    memory: &mut HashMap<String, Arc<MemFile>>,
-) -> Result<(), BoxError> {
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let entry = entry?;
+    found: &mut Vec<Candidate>,
+) -> Result<(), String> {
+    let unreadable = |e: std::io::Error| format!("{}: {e}", dir.display());
+    for entry in std::fs::read_dir(dir).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -662,38 +720,74 @@ fn snapshot(
             continue;
         }
         let key = format!("{url}/{name}");
-        // `file_type` does not follow symlinks, which are left out of the
-        // snapshot on purpose: no loops to guard against here, and they are
-        // still served from disk, where the escape check happens.
-        let kind = entry.file_type()?;
+        // `file_type` does not follow symlinks, which are left out of memory
+        // on purpose: no loops to guard against here, and they are still
+        // served from disk, where the escape check happens.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if kind.is_dir() {
             if wanted(&config.memory_paths, &key, true) {
-                snapshot(&entry.path(), &key, config, budget, memory)?;
+                candidates(&entry.path(), &key, config, found)?;
             }
         } else if kind.is_file() && wanted(&config.memory_paths, &key, false) {
-            let metadata = entry.metadata()?;
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if metadata.len() > config.memory_max_file
                 || kept_with_original(dir, url, &name, config)
             {
                 continue;
             }
             let path = entry.path();
-            let body = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let file = mem_file(&path, &metadata, body, 0, config.compress);
-            if !budget.try_take(file.cost()) {
-                return Err(format!(
-                    "files to hold in memory, with their compressed copies, exceed \
-                     PINGENV_MEMORY_MAX_TOTAL ({} bytes); raise it, narrow \
-                     PINGENV_ROUTE_<NAME>_MEMORY_PATHS, or lower \
-                     PINGENV_ROUTE_<NAME>_MEMORY_MAX_FILE (0 serves from disk)",
-                    budget.max
-                )
-                .into());
-            }
-            memory.insert(key, Arc::new(file));
+            found.push(Candidate {
+                key,
+                path,
+                metadata,
+            });
         }
     }
     Ok(())
+}
+
+/// Keeps the files that sites hold in memory in line with their directories,
+/// each at its own pace.
+pub struct Refresh {
+    sites: Vec<Arc<Site>>,
+}
+
+impl Refresh {
+    /// `None` when no site holds anything that could change.
+    pub fn new(sites: &[Option<Arc<Site>>]) -> Option<Refresh> {
+        let due = |site: &&Arc<Site>| site.refresh_every().is_some();
+        let sites: Vec<_> = sites.iter().flatten().filter(due).cloned().collect();
+        (!sites.is_empty()).then_some(Refresh { sites })
+    }
+}
+
+#[async_trait]
+impl BackgroundService for Refresh {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let passes = self.sites.iter().map(|site| async move {
+            let Some(every) = site.refresh_every() else {
+                return;
+            };
+            loop {
+                tokio::time::sleep(every).await;
+                let site = site.clone();
+                // Off the threads that serve requests: there are files to
+                // read and to compress.
+                let pass = tokio::task::spawn_blocking(move || site.refresh());
+                if let Err(e) = pass.await {
+                    warn!("a refresh of the files in memory did not finish: {e}");
+                }
+            }
+        });
+        tokio::select! {
+            _ = futures_util::future::join_all(passes) => {}
+            _ = shutdown.changed() => {}
+        }
+    }
 }
 
 fn servable_segment(segment: &str) -> bool {
@@ -912,7 +1006,7 @@ pub async fn serve(
         }
         // Only for paths that look like application routes: answering a
         // missing `/app.js` with HTML and a 200 hides the real problem.
-        Lookup::NotFound => match &site.fallback {
+        Lookup::NotFound => match &site.config.fallback {
             Some(fallback) if segments.last().is_none_or(|s| !s.contains('.')) => {
                 let found = site.find(fallback).await;
                 found.map(|found| (fallback.clone(), found))
@@ -1285,45 +1379,123 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn held(site: &Site, key: &str) -> Option<String> {
+        let memory = site.memory.read().unwrap();
+        let text = |file: &Arc<MemFile>| String::from_utf8(file.body.to_vec()).unwrap();
+        memory.get(key).map(text)
+    }
+
     #[test]
-    fn memory_copies_are_checked_again_after_the_window() {
+    fn a_refresh_brings_memory_in_line_with_the_directory() {
         let dir = temp_site("refresh");
+        std::fs::create_dir_all(dir.join("css")).unwrap();
         std::fs::write(dir.join("a.txt"), "one").unwrap();
         std::fs::write(dir.join("b.txt"), "to be removed").unwrap();
-        let config = static_site(&dir, 1000, &[""], Some(Duration::from_millis(50)));
+        std::fs::write(dir.join("css/old-name.css"), "moved").unwrap();
+        let config = static_site(&dir, 1000, &[""], Some(Duration::from_secs(300)));
         let budget = MemoryBudget::new(1 << 20);
         let site = Site::load("t", &config, budget.clone()).unwrap();
+        let used = || budget.used.load(Ordering::Relaxed);
+        assert_eq!(used(), 3 + 13 + 5);
+
+        // One of each: an edit, a removal, a move, an addition, and a file
+        // that is never to be served.
+        std::fs::write(dir.join("a.txt"), "changed!").unwrap();
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        std::fs::rename(dir.join("css/old-name.css"), dir.join("css/new-name.css")).unwrap();
+        std::fs::write(dir.join("added.txt"), "new").unwrap();
+        std::fs::write(dir.join(".hidden"), "never").unwrap();
+        // Until the next refresh memory is what it was: nothing looks at the
+        // disk for a file that is held.
+        assert_eq!(held(&site, "/a.txt").as_deref(), Some("one"));
+        assert_eq!(held(&site, "/b.txt").as_deref(), Some("to be removed"));
+        assert_eq!(held(&site, "/added.txt"), None);
+
+        site.refresh();
+        assert_eq!(keys(&site), ["/a.txt", "/added.txt", "/css/new-name.css"]);
+        assert_eq!(held(&site, "/a.txt").as_deref(), Some("changed!"));
+        assert_eq!(held(&site, "/added.txt").as_deref(), Some("new"));
+        assert_eq!(held(&site, "/css/new-name.css").as_deref(), Some("moved"));
+        // What left gave its bytes back, what came took its own.
+        assert_eq!(used(), 8 + 3 + 5);
+
+        // With nothing changed, nothing is read again.
+        let copy = |key: &str| site.memory.read().unwrap()[key].clone();
+        let before = copy("/added.txt");
+        site.refresh();
+        assert!(Arc::ptr_eq(&before, &copy("/added.txt")));
+
+        // Growing past the per-file limit: back to the disk.
+        std::fs::write(dir.join("a.txt"), vec![b'x'; 2000]).unwrap();
+        site.refresh();
+        assert_eq!(keys(&site), ["/added.txt", "/css/new-name.css"]);
+        assert_eq!(used(), 3 + 5);
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
             .build()
             .unwrap();
-        let body = |found: Option<Found>| match found {
-            Some(Found::Memory(f)) => Some(String::from_utf8(f.body.to_vec()).unwrap()),
-            _ => None,
+        let found = rt.block_on(site.find("/a.txt"));
+        assert!(matches!(found, Some(Found::Disk(..))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_there_is_no_room_for_waits_on_disk_until_there_is() {
+        let dir = temp_site("refresh-room");
+        std::fs::write(dir.join("held.txt"), "0123456789").unwrap();
+        let config = static_site(&dir, 1000, &[""], Some(Duration::from_secs(300)));
+        let budget = MemoryBudget::new(20);
+        let site = Site::load("t", &config, budget.clone()).unwrap();
+        let used = || budget.used.load(Ordering::Relaxed);
+
+        // Ten bytes of room: enough for one of these and not for the other.
+        std::fs::write(dir.join("big.txt"), "too much to add").unwrap();
+        std::fs::write(dir.join("small.txt"), "fits").unwrap();
+        site.refresh();
+        assert_eq!(keys(&site), ["/held.txt", "/small.txt"]);
+        assert_eq!((used(), site.left_on_disk.load(Ordering::Relaxed)), (14, 1));
+
+        // The room a file leaves behind is there for the one that waited,
+        // within the same pass.
+        std::fs::remove_file(dir.join("held.txt")).unwrap();
+        site.refresh();
+        assert_eq!(keys(&site), ["/big.txt", "/small.txt"]);
+        assert_eq!((used(), site.left_on_disk.load(Ordering::Relaxed)), (19, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_leaves_memory_as_it_is() {
+        let dir = temp_site("refresh-gone");
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let config = static_site(&dir, 1000, &[""], Some(Duration::from_secs(300)));
+        let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+
+        // Not the same as a directory that is there and empty: this says
+        // nothing about the files, so the ones of a moment ago are kept.
+        std::fs::remove_dir_all(&dir).unwrap();
+        site.refresh();
+        assert_eq!(held(&site, "/a.txt").as_deref(), Some("one"));
+
+        std::fs::create_dir_all(&dir).unwrap();
+        site.refresh();
+        assert_eq!(keys(&site), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_is_held_is_refreshed_only_where_it_can_change() {
+        let dir = temp_site("refresh-every");
+        let every = |max_file, refresh| {
+            let config = static_site(&dir, max_file, &[""], refresh);
+            let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+            site.refresh_every()
         };
-
-        rt.block_on(async {
-            // Inside the window, a change on disk is not noticed.
-            std::fs::write(dir.join("a.txt"), "changed!").unwrap();
-            assert_eq!(body(site.find("/a.txt").await).as_deref(), Some("one"));
-
-            // After it, the new content is loaded, and the budget follows.
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            assert_eq!(body(site.find("/a.txt").await).as_deref(), Some("changed!"));
-            assert_eq!(budget.used.load(Ordering::Relaxed), 8 + 13);
-
-            // A deleted file is dropped, and its bytes are given back.
-            std::fs::remove_file(dir.join("b.txt")).unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            assert!(site.find("/b.txt").await.is_none());
-            assert_eq!(budget.used.load(Ordering::Relaxed), 8);
-
-            // Growing past the per-file limit falls back to the disk.
-            std::fs::write(dir.join("a.txt"), vec![b'x'; 2000]).unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            assert!(matches!(site.find("/a.txt").await, Some(Found::Disk(..))));
-            assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-        });
+        let window = Some(Duration::from_secs(10));
+        assert_eq!(every(1000, window), window);
+        // Nothing is held: nothing to keep up to date.
+        assert_eq!(every(0, window), None);
+        // PINGENV_ROUTE_<NAME>_MEMORY_REFRESH=0: a snapshot taken at startup.
+        assert_eq!(every(1000, None), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1604,7 +1776,7 @@ mod tests {
             assert_eq!(gunzip(&body), first.as_bytes());
 
             std::fs::write(dir.join("app.js"), &second).unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            site.refresh();
             let (coding, body, tag) = pick(&site, "/app.js", only_gzip).await;
             assert_eq!(coding, Some(Coding::Gzip));
             assert_eq!(gunzip(&body), second.as_bytes());

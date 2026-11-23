@@ -121,6 +121,7 @@ cp "$SITE/auto.js" "$SITE/pre.js"
 JS_SUM="$(sha256sum <"$SITE/auto.js")"
 # What a build names after its content, so that the name never means another.
 echo 'console.log("bundle")' >"$SITE/main-4f9a1c.js"
+echo 'here at startup, deleted later' >"$SITE/doomed.txt"
 python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' <"$SITE/pre.js" >"$SITE/pre.js.gz"
 printf 'brotli-stand-in' >"$SITE/pre.js.br"
 
@@ -373,15 +374,27 @@ check "other paths still reach the upstream" \
     "$(get -k "https://app.pingenv.test:$HTTPS/statics" | field 'd["upstream"]')" A
 
 check "limit 0 serves small files from disk" "$(get -k "$L/css/site.css") $(src 'live.pingenv.test/css/site.css')" 'body{} upstream=disk'
+# A deploy while the servers run: a file edited, files added (one of them a
+# bundle that shrinks), a file deleted.
+F="https://fresh.pingenv.test:$HTTPS"
 echo 'body{color:red}' >"$SITE/css/site.css"
 echo 'new' >"$SITE/new.txt"
-check "memory copy is a startup snapshot" "$(get -k "$S/css/site.css")" 'body{}'
+cp "$SITE/auto.js" "$SITE/chunk-later.js"
+rm "$SITE/doomed.txt"
+check "what is held in memory stays as it was until the next refresh" \
+    "$(get -k "$S/css/site.css") $(code "$S/doomed.txt")" 'body{} 200'
 check "disk route sees the change" "$(get -k "$L/css/site.css")" 'body{color:red}'
-check "files added later are served from disk" "$(get -k "$S/new.txt") $(src 'site.pingenv.test/new.txt')" 'new upstream=disk'
+check "a file added since is served from disk meanwhile" "$(get -k "$S/new.txt") $(src 'site.pingenv.test/new.txt')" 'new upstream=disk'
 sleep 2.5
-check "a short refresh window picks the change up" "$(get -k "https://fresh.pingenv.test:$HTTPS/css/site.css")" 'body{color:red}'
+check "a short refresh window picks the change up" "$(get -k "$F/css/site.css")" 'body{color:red}'
 check "and the file is still served from memory" "$(src 'fresh.pingenv.test/css/site.css')" upstream=memory
-check "the default window keeps the old copy" "$(get -k "$S/css/site.css")" 'body{}'
+check "a file added after startup is in memory by then, with its compressed copy" \
+    "$(hdr content-encoding -H 'Accept-Encoding: gzip' "$F/chunk-later.js") $(get -k --compressed "$F/chunk-later.js" | sha256sum) $(src 'fresh.pingenv.test/chunk-later.js')" \
+    "gzip $JS_SUM upstream=memory"
+check "and a deleted one is gone from it" "$(code "$F/doomed.txt")" 404
+check "the refresh says what it did" \
+    "$(grep -q 'route fresh: files in memory brought up to date: ' "$WORK/selfsigned.log" && echo yes || echo no)" yes
+check "the default window keeps the old copy" "$(get -k "$S/css/site.css") $(code "$S/doomed.txt")" 'body{} 200'
 PA="https://paths.pingenv.test:$HTTPS"
 check "MEMORY_PATHS: a chosen directory is in memory" "$(get -k "$PA/css/site.css" >/dev/null; src 'paths.pingenv.test/css/site.css')" upstream=memory
 check "MEMORY_PATHS: the rest is on disk" "$(get -k "$PA/docs/index.html" >/dev/null; src 'paths.pingenv.test/docs/index.html')" upstream=disk

@@ -373,7 +373,7 @@ impl Drop for Entered {
 pub struct Gateway {
     router: Router,
     /// One entry per route; `Some` for routes that serve files.
-    sites: Vec<Option<Site>>,
+    sites: Vec<Option<Arc<Site>>>,
     /// One entry per route; `Some` for routes with a rate limit.
     limiters: Vec<Option<RateLimiter>>,
     counters: Vec<AtomicUsize>,
@@ -392,7 +392,7 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(
         config: &Config,
-        sites: Vec<Option<Site>>,
+        sites: Vec<Option<Arc<Site>>>,
         challenges: Arc<ChallengeStore>,
         in_flight: InFlight,
     ) -> Self {

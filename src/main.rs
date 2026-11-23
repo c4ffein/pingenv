@@ -165,10 +165,11 @@ fn run(config: Config) -> Result<(), BoxError> {
             route
                 .site
                 .as_ref()
-                .map(|site| Site::load(&route.name, site, budget.clone()))
+                .map(|site| Site::load(&route.name, site, budget.clone()).map(Arc::new))
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let refresh = files::Refresh::new(&sites);
 
     let acme_hosts = config.acme_hosts();
     let acme = if acme_hosts.is_empty() {
@@ -244,6 +245,9 @@ fn run(config: Config) -> Result<(), BoxError> {
     server.add_service(background_service("drain", Drain { in_flight }));
     if let Some(acme) = acme {
         server.add_service(background_service("acme", acme));
+    }
+    if let Some(refresh) = refresh {
+        server.add_service(background_service("files", refresh));
     }
     if !reloader.is_empty() {
         server.add_service(background_service("cert-reload", reloader));
