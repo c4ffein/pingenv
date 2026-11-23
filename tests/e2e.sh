@@ -68,7 +68,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test up.pingenv.test idle.pingenv.test go.pingenv.test www2.pingenv.test lim.pingenv.test tick.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test app2.pingenv.test ws.pingenv.test pt.pingenv.test slow.pingenv.test fresh.pingenv.test paths.pingenv.test m.pingenv.test own.pingenv.test gone.pingenv.test up.pingenv.test idle.pingenv.test go.pingenv.test www2.pingenv.test lim.pingenv.test tick.pingenv.test rel.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -125,6 +125,16 @@ echo 'here at startup, deleted later' >"$SITE/doomed.txt"
 python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' <"$SITE/pre.js" >"$SITE/pre.js.gz"
 printf 'brotli-stand-in' >"$SITE/pre.js.br"
 
+# A site kept as one directory per build, with a link to the one that is live.
+# Each has a page small enough for memory and a file that is not.
+RELROOT="$WORK/rel"
+for n in one two; do
+    mkdir -p "$RELROOT/releases/$n"
+    echo "<h1>$n</h1>" >"$RELROOT/releases/$n/index.html"
+    { echo "large $n"; head -c 100000 /dev/zero; } >"$RELROOT/releases/$n/large.txt"
+done
+ln -s releases/one "$RELROOT/current"
+
 # A certificate for a host that two routes share, named on only one of them.
 OWN="$WORK/own"; mkdir -p "$OWN"
 make_cert "$OWN" own own.pingenv.test; install_cert "$OWN"
@@ -139,6 +149,7 @@ env -i \
     PINGENV_ROUTE_LB_HOST=lb.pingenv.test PINGENV_ROUTE_LB_UPSTREAM=127.0.0.1:18001,127.0.0.1:18009,127.0.0.1:18002 \
     PINGENV_ROUTE_SITE_HOST=site.pingenv.test PINGENV_ROUTE_SITE_ROOT="$SITE" \
     PINGENV_ROUTE_SITE_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_SITE_FALLBACK=/index.html \
+    PINGENV_ROUTE_SITE_DIR_REFRESH=1h \
     PINGENV_ROUTE_SITE_IMMUTABLE='/main-*.js' \
     PINGENV_ROUTE_ASSETS_HOST=app.pingenv.test PINGENV_ROUTE_ASSETS_PATH=/static \
     PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
@@ -148,7 +159,7 @@ env -i \
     PINGENV_ROUTE_PT_HOST=pt.pingenv.test PINGENV_ROUTE_PT_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_PT_ACME_PASSTHROUGH=true \
     PINGENV_ROUTE_SLOW_HOST=slow.pingenv.test PINGENV_ROUTE_SLOW_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_SLOW_READ_TIMEOUT=10s \
     PINGENV_ROUTE_FRESH_HOST=fresh.pingenv.test PINGENV_ROUTE_FRESH_ROOT="$SITE" \
-    PINGENV_ROUTE_FRESH_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_FRESH_MEMORY_REFRESH=1s \
+    PINGENV_ROUTE_FRESH_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_FRESH_DIR_REFRESH=1s \
     PINGENV_ROUTE_PATHS_HOST=paths.pingenv.test PINGENV_ROUTE_PATHS_ROOT="$SITE" \
     PINGENV_ROUTE_PATHS_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_PATHS_MEMORY_PATHS=/css \
     PINGENV_ROUTE_SPLIT_HOST=split.pingenv.test PINGENV_ROUTE_SPLIT_UPSTREAM=127.0.0.1:18090 \
@@ -164,6 +175,8 @@ env -i \
     PINGENV_ROUTE_LIM_HOST=lim.pingenv.test PINGENV_ROUTE_LIM_UPSTREAM=127.0.0.1:18001 \
     PINGENV_ROUTE_LIM_RATE_LIMIT=6/m PINGENV_ROUTE_LIM_RATE_BURST=5 \
     PINGENV_ROUTE_TICK_HOST=tick.pingenv.test PINGENV_ROUTE_TICK_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_TICK_RATE_LIMIT=1/s \
+    PINGENV_ROUTE_REL_HOST=rel.pingenv.test PINGENV_ROUTE_REL_ROOT="$RELROOT/current" \
+    PINGENV_ROUTE_REL_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_REL_DIR_REFRESH=1s \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -394,10 +407,30 @@ check "a file added after startup is in memory by then, with its compressed copy
 check "and a deleted one is gone from it" "$(code "$F/doomed.txt")" 404
 check "the refresh says what it did" \
     "$(grep -q 'route fresh: files in memory brought up to date: ' "$WORK/selfsigned.log" && echo yes || echo no)" yes
-check "the default window keeps the old copy" "$(get -k "$S/css/site.css") $(code "$S/doomed.txt")" 'body{} 200'
+check "a longer time between refreshes keeps the old copy" "$(get -k "$S/css/site.css") $(code "$S/doomed.txt")" 'body{} 200'
 PA="https://paths.pingenv.test:$HTTPS"
 check "MEMORY_PATHS: a chosen directory is in memory" "$(get -k "$PA/css/site.css" >/dev/null; src 'paths.pingenv.test/css/site.css')" upstream=memory
 check "MEMORY_PATHS: the rest is on disk" "$(get -k "$PA/docs/index.html" >/dev/null; src 'paths.pingenv.test/docs/index.html')" upstream=disk
+
+echo "== a root that is a link to the live build"
+REL="https://rel.pingenv.test:$HTTPS"
+check "the build the link leads to is served, from memory and from disk" \
+    "$(get -k "$REL/") $(get -k -r 0-8 "$REL/large.txt") $(src 'rel.pingenv.test/') $(src 'rel.pingenv.test/large.txt')" \
+    '<h1>one</h1> large one upstream=memory upstream=disk'
+# What a deploy does to switch: a new link under another name, renamed over
+# the old one.
+ln -sfn releases/two "$RELROOT/.current" && mv -T "$RELROOT/.current" "$RELROOT/current"
+sleep 2.5
+check "when the link moves, a refresh follows it, for both" \
+    "$(get -k "$REL/") $(get -k -r 0-8 "$REL/large.txt")" '<h1>two</h1> large two'
+rm -rf "$RELROOT/releases/one"
+sleep 1.5
+check "and the build it left can be deleted" "$(get -k "$REL/") $(code "$REL/large.txt")" '<h1>two</h1> 200'
+check "the log says where it went" \
+    "$(grep -c 'route rel: .*/current now leads to .*/releases/two: serving from there, 1 files held' "$WORK/selfsigned.log")" 1
+check "a link that leads nowhere changes nothing, and that is said once" \
+    "$(ln -sfn releases/gone "$RELROOT/.current" && mv -T "$RELROOT/.current" "$RELROOT/current"; sleep 2.5; get -k "$REL/") $(grep -c 'route rel: .*/current cannot be followed' "$WORK/selfsigned.log")" \
+    '<h1>two</h1> 1'
 
 echo "== redirects"
 check "a route can answer with a redirect, whatever the path" \

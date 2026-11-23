@@ -70,7 +70,7 @@ plain HTTP is sent to HTTPS first.
 | `ROOT` | Absolute path of the directory to serve. The route's path prefix maps onto it: with `PATH=/docs`, `/docs/a.css` is `ROOT/a.css`. |
 | `MEMORY_MAX_FILE` | Files up to this size are held in memory; larger ones are streamed from disk. Default `0`: everything is served from disk, and the operating system's page cache keeps hot files fast. |
 | `MEMORY_PATHS` | With `MEMORY_MAX_FILE` set: which files and directories, below `ROOT`, may be held in memory. Comma separated, like `/index.html,/assets`. Default `/`: everything. |
-| `MEMORY_REFRESH` | How often the directory is read again and memory brought in line with it: new files are loaded, changed ones loaded again, deleted ones dropped. Default `5m`; `0` never looks again (a startup snapshot). |
+| `DIR_REFRESH` | How often the directory is looked at again. If `ROOT` is a link that now leads to another directory, that one is served from then on; and what is held in memory is brought in line with the directory: new files are loaded, changed ones loaded again, deleted ones dropped. Default `5s`; `0` never looks again (what was there at startup). |
 | `FALLBACK` | File served when nothing matches, for single-page apps, e.g. `/index.html`. Only applies to paths whose last segment has no dot, so a missing `/app.js` is still a 404. |
 | `CACHE_CONTROL` | `Cache-Control` header for this route. Default `no-cache` (browsers revalidate, and get a cheap 304). |
 | `IMMUTABLE` | Files whose content never changes under the same name, like the hashed bundles of a build. Patterns for the path below `ROOT`, comma separated, where `*` stands for any run of characters: `/assets/*,/main-*.js,*.woff2`. They are sent with `Cache-Control: public, max-age=31536000, immutable` instead of `CACHE_CONTROL`, so a browser that has one does not ask again. |
@@ -82,14 +82,16 @@ Durations are seconds, or use `ms`/`s`/`m`/`h`: `30`, `500ms`, `5m`.
 **Memory is opt-in.** The files chosen by `MEMORY_MAX_FILE` and `MEMORY_PATHS`
 are loaded at startup and counted against `PINGENV_MEMORY_MAX_TOTAL`, so a
 directory bigger than expected fails at startup, not under load. After that
-the directory is read again every `MEMORY_REFRESH`, in the background, and
+the directory is read again every `DIR_REFRESH`, in the background, and
 memory is brought in line with it in one step: what a deploy edited, added,
 moved or deleted shows up together, within that time, and a request for a file
 held in memory never waits for the disk. A file is recognised as changed by
-its size and its modification time. Files that are not held (too large,
+its size and its modification time, so a pass over a directory where nothing
+changed costs one look at each file; if it ever takes more than a twentieth of
+the time between two passes, the log says so. Files that are not held (too large,
 outside `MEMORY_PATHS`, added since the last pass, or more than
 `PINGENV_MEMORY_MAX_TOTAL` has room for) are read from disk. Set
-`MEMORY_REFRESH=0` for a frozen snapshot, which suits a site baked into an
+`DIR_REFRESH=0` for a frozen snapshot, which suits a site baked into an
 image.
 
 **Deploying.** pingenv serves a file from the moment it has its name in the
@@ -101,8 +103,29 @@ same filesystem first, then rename into place, which is atomic. A hidden
 directory inside the root does well as "somewhere else": nothing hidden is
 ever served, or held in memory.
 
-A whole build can take the place of another in one step, by exchanging the two
-directories (GNU coreutils 9.5 or later):
+The arrangement that leaves the least to chance gives every build a directory
+of its own, never touched again once it is complete, and a link that says
+which one is live. Point `ROOT` at the link:
+
+```sh
+scp -r dist box:/srv/www/site/releases/.incoming
+ssh box 'cd /srv/www/site && mv releases/.incoming releases/42 &&
+         ln -sfn releases/42 .current && mv -T .current current'
+```
+
+with `ROOT=/srv/www/site/current`. Renaming the new link over the old one is
+atomic, and pingenv looks at where the link leads every `DIR_REFRESH`: when
+that has changed it moves to the new directory in one step, for what is held
+in memory and for what is read from disk alike. So keep the build that was
+live until the next deploy rather than deleting it in the same breath: for a
+few seconds it is still the one being served. In a container, mount the
+directory that holds the link and the builds (`/srv/www/site`), and make the
+link relative, as above, so that it leads to the same place inside. A link
+that leads nowhere changes nothing: the last good directory stays, and the
+log says so.
+
+Without a link, a whole build can take the place of another in one step by
+exchanging the two directories (GNU coreutils 9.5 or later):
 
 ```sh
 scp -r dist box:/srv/www/site.new
@@ -112,12 +135,16 @@ ssh box 'mv --exchange -T /srv/www/site.new /srv/www/site && rm -r /srv/www/site
 pingenv has to be able to see the exchange: a container that mounts
 `/srv/www/site` keeps the directory it was started with, whatever that is
 called afterwards, so mount `/srv/www` and point `ROOT` at the directory
-inside it. And the old build is gone from that moment, which is what a
-single-page application does not want: a page loaded a second earlier, or an
-hour, still asks for the scripts it came with.
+inside it.
 
-For a single-page application, whose bundles carry a hash of their content in
-their names, the better pattern keeps both builds side by side for a while:
+Either way the old build is gone from one moment to the next, which is what a
+single-page application does not want: a page loaded a second earlier, or an
+hour, still asks for the scripts it came with. A build directory can be made
+to carry the bundles of the builds before it for that reason.
+
+In a single directory, for a single-page application whose bundles carry a
+hash of their content in their names, the pattern that keeps both builds side
+by side for a while is:
 
 1. **Copy the build into a hidden directory** inside the root.
 2. **Rename the new bundles into place.** Their names are new, so no page
@@ -146,14 +173,15 @@ are new or changed, while a deploy may be going on. The cases:
 - **The new bundles seen, the new page not yet:** the old page is served, with
   its old bundles, which are still there.
 - **A file deleted, or replaced under the same name:** the copy in memory is
-  served until the next pass, so for `MEMORY_REFRESH` at most. A script that
+  served until the next pass, so for `DIR_REFRESH` at most. A script that
   keeps its name from one build to the next can therefore be out of step with
   the page for that long. Hashed names are what rules it out: a name that only
   ever stands for one content cannot be out of step with anything.
 - **A file copied straight to its final name and caught half written:** held
   as it was caught, and served that way, until the next pass. Rename instead.
-- **A `ROOT` that is a symbolic link** is followed once, at startup. Pointing
-  the link at another directory later changes nothing until a restart.
+- **A `ROOT` that is a link, pointed at another directory:** the old
+  directory is served, from memory and from disk, until the next pass, and
+  the new one after it. Never some of each.
 - **A directory that cannot be read** when a pass comes by: memory is left as
   it is.
 

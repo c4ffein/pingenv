@@ -59,9 +59,10 @@ pub struct StaticSite {
     /// URL paths below the root (files or directories) eligible for memory,
     /// without a trailing slash. An empty entry is the root: everything.
     pub memory_paths: Vec<String>,
-    /// How long a memory copy is trusted before the file is checked again.
-    /// `None` never re-checks: the copy is a startup snapshot.
-    pub memory_refresh: Option<Duration>,
+    /// How often the directory is looked at again: where `root` leads, if
+    /// it is a link, and which files are in it. `None` never looks again:
+    /// what is served is what was there at startup.
+    pub dir_refresh: Option<Duration>,
     /// Served for paths that match no file, for single-page applications.
     pub fallback: Option<String>,
     pub cache_control: String,
@@ -215,7 +216,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "REDIRECT_STATUS",
     "MEMORY_MAX_FILE",
     "MEMORY_PATHS",
-    "MEMORY_REFRESH",
+    "DIR_REFRESH",
     "ACME_PASSTHROUGH",
     "MAX_BODY_SIZE",
     "READ_TIMEOUT",
@@ -239,7 +240,9 @@ const ROUTE_FIELDS: &[&str] = &[
 /// Off by default: the operating system already keeps hot files in its page
 /// cache, so a copy in this process mostly adds staleness.
 const DEFAULT_MEMORY_MAX_FILE: u64 = 0;
-const DEFAULT_MEMORY_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Soon enough for a deploy to feel immediate. A pass over a directory that
+/// did not change costs one look at each file, nothing more.
+const DEFAULT_DIR_REFRESH: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -903,10 +906,10 @@ fn parse_route(
                         .collect()
                 }
             };
-            let memory_refresh = match field("MEMORY_REFRESH") {
-                None => Some(DEFAULT_MEMORY_REFRESH),
+            let dir_refresh = match field("DIR_REFRESH") {
+                None => Some(DEFAULT_DIR_REFRESH),
                 Some(v) => parse_duration(v).unwrap_or_else(|why| {
-                    errors.push(format!("{}: '{v}' {why}", var("MEMORY_REFRESH")));
+                    errors.push(format!("{}: '{v}' {why}", var("DIR_REFRESH")));
                     None
                 }),
             };
@@ -944,7 +947,7 @@ fn parse_route(
                 root: PathBuf::from(root),
                 memory_max_file,
                 memory_paths,
-                memory_refresh,
+                dir_refresh,
                 fallback,
                 cache_control,
                 immutable,
@@ -956,7 +959,7 @@ fn parse_route(
                 "FALLBACK",
                 "MEMORY_MAX_FILE",
                 "MEMORY_PATHS",
-                "MEMORY_REFRESH",
+                "DIR_REFRESH",
                 "CACHE_CONTROL",
                 "IMMUTABLE",
                 "COMPRESS",
@@ -1519,7 +1522,7 @@ mod tests {
                 root: "/srv/site".into(),
                 memory_max_file: 65536,
                 memory_paths: vec![String::new()],
-                memory_refresh: Some(Duration::from_secs(300)),
+                dir_refresh: Some(Duration::from_secs(5)),
                 fallback: Some("/index.html".into()),
                 cache_control: "no-cache".into(),
                 immutable: Vec::new(),
@@ -1543,20 +1546,20 @@ mod tests {
             ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
             ("PINGENV_ROUTE_SITE_MEMORY_MAX_FILE", "1MiB"),
             ("PINGENV_ROUTE_SITE_MEMORY_PATHS", "/css/, /index.html,/"),
-            ("PINGENV_ROUTE_SITE_MEMORY_REFRESH", "30s"),
+            ("PINGENV_ROUTE_SITE_DIR_REFRESH", "30s"),
         ])
         .unwrap();
         let site = cfg.routes[0].site.as_ref().unwrap();
         assert_eq!(site.memory_paths, ["/css", "/index.html", ""]);
-        assert_eq!(site.memory_refresh, Some(Duration::from_secs(30)));
+        assert_eq!(site.dir_refresh, Some(Duration::from_secs(30)));
 
         let never = env(&[
             ("PINGENV_ROUTE_SITE_HOST", "example.com"),
             ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
-            ("PINGENV_ROUTE_SITE_MEMORY_REFRESH", "0"),
+            ("PINGENV_ROUTE_SITE_DIR_REFRESH", "0"),
         ])
         .unwrap();
-        assert_eq!(never.routes[0].site.as_ref().unwrap().memory_refresh, None);
+        assert_eq!(never.routes[0].site.as_ref().unwrap().dir_refresh, None);
 
         let plain = env(&[
             ("PINGENV_ROUTE_SITE_HOST", "example.com"),
@@ -1570,7 +1573,7 @@ mod tests {
             ("PINGENV_ROUTE_SITE_HOST", "example.com"),
             ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
             ("PINGENV_ROUTE_SITE_MEMORY_PATHS", "css"),
-            ("PINGENV_ROUTE_SITE_MEMORY_REFRESH", "soon"),
+            ("PINGENV_ROUTE_SITE_DIR_REFRESH", "soon"),
         ])
         .unwrap_err()
         .join("\n");
@@ -1578,7 +1581,7 @@ mod tests {
             errs.contains("MEMORY_PATHS: every path must start with /"),
             "{errs}"
         );
-        assert!(errs.contains("MEMORY_REFRESH: 'soon'"), "{errs}");
+        assert!(errs.contains("DIR_REFRESH: 'soon'"), "{errs}");
     }
 
     #[test]

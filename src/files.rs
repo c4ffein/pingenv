@@ -3,12 +3,17 @@
 //! Files are streamed from disk by default: the operating system keeps hot
 //! files in its page cache, so a second copy in this process buys little. A
 //! route can opt in to holding small files in memory. Those copies are loaded
-//! at startup, and once per refresh window (five minutes by default) the
+//! at startup, and at every refresh (five seconds apart by default) the
 //! directory is walked again and memory brought in line with it: new files
 //! are loaded, changed ones loaded again, deleted ones dropped. A request
 //! for a file held in memory never touches the disk. Anything not in memory
 //! (too large, outside the chosen paths, added since the last walk, or more
 //! than there is room for) is read from disk on each request.
+//!
+//! The root may be a symbolic link, as in the layout where every build has a
+//! directory of its own and a link says which one is live. A refresh looks
+//! at where the link leads, and when that has changed it moves to the new
+//! directory in one step, for memory and for the disk alike.
 //!
 //! Text is sent compressed to clients that can read it, without compressing
 //! anything twice: a file held in memory is gzipped once when it is loaded,
@@ -21,9 +26,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -47,6 +52,10 @@ const COMPRESS_MIN: usize = 256;
 /// The usual middle setting. Higher levels shave a percent or two off and
 /// take several times as long, which is paid at startup.
 const GZIP_LEVEL: u32 = 6;
+/// A refresh that takes more than this share of the time between two of them
+/// is worth a line in the log: the directory is large for how often it is
+/// read.
+const SLOW_REFRESH: u32 = 20;
 
 /// A way of compressing a response that the client can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,8 +285,10 @@ enum Lookup {
 pub struct Site {
     /// The route's name, for the log.
     route: String,
-    /// Canonical, so that symlinks pointing outside it can be detected.
-    root: PathBuf,
+    /// The directory being served: where `ROOT` led when it was last looked
+    /// at. Canonical, so that symlinks pointing outside it can be detected.
+    /// Written by `refresh`, and with `memory` when it is: lock this first.
+    root: RwLock<PathBuf>,
     /// Keyed by URL path below the root, like `/css/site.css`. Written at
     /// startup and by `refresh`, and by nothing else.
     memory: RwLock<HashMap<String, Arc<MemFile>>>,
@@ -286,6 +297,11 @@ pub struct Site {
     /// How many files the last refresh found no room for, so that it is
     /// said when that changes and not at every pass.
     left_on_disk: AtomicUsize,
+    /// What the last refresh could not do, so that it is said once and not
+    /// every few seconds for as long as it lasts.
+    trouble: Mutex<Option<String>>,
+    /// Whether the last refresh was a slow one, for the same reason.
+    slow: AtomicBool,
 }
 
 /// For a file that will never change under its name: a browser that has it
@@ -370,11 +386,13 @@ impl Site {
 
         Ok(Site {
             route: route.to_string(),
-            root,
+            root: RwLock::new(root),
             memory: RwLock::new(memory),
             budget,
             config: config.clone(),
             left_on_disk: AtomicUsize::new(0),
+            trouble: Mutex::new(None),
+            slow: AtomicBool::new(false),
         })
     }
 
@@ -388,29 +406,63 @@ impl Site {
         }
     }
 
-    /// How often memory is brought in line with the directory. `None` when
-    /// nothing is held, or when what is held is a snapshot taken at startup.
+    /// How often the directory is looked at again. `None` for a snapshot
+    /// taken at startup.
     fn refresh_every(&self) -> Option<Duration> {
-        let holds = self.config.memory_max_file > 0;
-        self.config.memory_refresh.filter(|_| holds)
+        self.config.dir_refresh
     }
 
-    /// Brings what is held in memory in line with the directory: files that
-    /// are new are loaded, files that changed are loaded again, and those
-    /// that are gone, or may no longer be held, are dropped. Requests see
-    /// all of it happen at once, so a site that was replaced as a whole is
-    /// never served half old and half new from here.
+    /// Says what a refresh could not do, unless it has just been said.
+    fn trouble(&self, what: String) {
+        let mut last = self.trouble.lock().unwrap();
+        if last.as_ref() != Some(&what) {
+            warn!("route {}: {what}", self.route);
+            *last = Some(what);
+        }
+    }
+
+    /// Looks at the directory again and brings what is served in line with
+    /// it. Where `ROOT` leads is followed first: if that is another directory
+    /// than before, everything moves to it. Then the files held in memory:
+    /// those that are new are loaded, those that changed are loaded again,
+    /// and those that are gone, or may no longer be held, are dropped.
+    ///
+    /// Requests see all of it happen at once. In particular the directory
+    /// that is read from and the files held in memory are never those of two
+    /// different places.
     ///
     /// This reads and compresses files: not for a thread that serves requests.
     fn refresh(&self) {
+        let root = self.root.read().unwrap().clone();
+        // Whatever cannot be read just now says nothing about what should be
+        // served: better the files of a moment ago than none.
+        let target = match std::fs::canonicalize(&self.config.root) {
+            Ok(target) if target.is_dir() => target,
+            Ok(target) => {
+                let (asked, serving) = (self.config.root.display(), root.display());
+                let found = target.display();
+                self.trouble(format!(
+                    "{asked} leads to {found}, which is not a directory: still serving {serving}"
+                ));
+                return;
+            }
+            Err(e) => {
+                let (asked, serving) = (self.config.root.display(), root.display());
+                self.trouble(format!(
+                    "{asked} cannot be followed ({e}): still serving {serving}"
+                ));
+                return;
+            }
+        };
+        let moved = target != root;
         let mut found = Vec::new();
-        if let Err(e) = candidates(&self.root, "", &self.config, &mut found) {
-            // A directory that cannot be read just now says nothing about
-            // what is in it: better the files of a moment ago than none.
-            warn!(
-                "route {}: files in memory left as they are: {e}",
-                self.route
-            );
+        if self.config.memory_max_file > 0
+            && let Err(e) = candidates(&target, "", &self.config, &mut found)
+        {
+            self.trouble(format!(
+                "{e}: still serving what was held from {}",
+                root.display()
+            ));
             return;
         }
         let held: HashMap<String, (Meta, u64)> = {
@@ -420,13 +472,15 @@ impl Site {
             memory.iter().map(entry).collect()
         };
 
-        // First what stays as it is, which costs one look at each file.
+        // First what stays as it is, which costs one look at each file. In
+        // another directory nothing does: a file of the same name, size and
+        // date there is still another file.
         let mut unchanged = HashSet::new();
         let mut to_load = Vec::new();
         for candidate in found {
             let now = Meta::new(&candidate.path, &candidate.metadata);
             match held.get(&candidate.key) {
-                Some((was, _)) if was.modified == now.modified && was.len == now.len => {
+                Some((was, _)) if !moved && was.modified == now.modified && was.len == now.len => {
                     unchanged.insert(candidate.key);
                 }
                 _ => to_load.push(candidate),
@@ -461,7 +515,8 @@ impl Site {
         let (mut added, mut reloaded) = (0, 0);
         let replaced = loaded.iter().filter(|(key, _)| held.contains_key(key));
         let gone = held.len() - unchanged.len() - replaced.count();
-        {
+        let holding = {
+            let mut serving = self.root.write().unwrap();
             let mut memory = self.memory.write().unwrap();
             // What leaves goes first, so that its room is there for what
             // arrives.
@@ -484,19 +539,48 @@ impl Site {
                 }
                 memory.insert(key, Arc::new(file));
             }
-        }
+            if moved {
+                *serving = target.clone();
+            }
+            memory.len()
+        };
+        *self.trouble.lock().unwrap() = None;
 
         let before = self.left_on_disk.swap(no_room, Ordering::Relaxed);
-        if added + reloaded + gone > 0 || no_room != before {
-            let left = match no_room {
-                0 => String::new(),
-                n => format!("; {n} left on disk, PINGENV_MEMORY_MAX_TOTAL has no room for them"),
-            };
+        let left = match no_room {
+            0 => String::new(),
+            n => format!("; {n} left on disk, PINGENV_MEMORY_MAX_TOTAL has no room for them"),
+        };
+        if moved {
+            info!(
+                "route {}: {} now leads to {}: serving from there, {holding} files held in \
+                 memory{left}",
+                self.route,
+                self.config.root.display(),
+                target.display()
+            );
+        } else if added + reloaded + gone > 0 || no_room != before {
             info!(
                 "route {}: files in memory brought up to date: {added} new, {reloaded} changed, \
                  {gone} gone{left}",
                 self.route
             );
+        }
+    }
+
+    /// Says when reading the directory takes a good part of the time between
+    /// two refreshes, once, and again only after it has stopped being so.
+    fn pace(&self, took: Duration, every: Duration) {
+        let slow = took > every / SLOW_REFRESH;
+        if slow && !self.slow.swap(true, Ordering::Relaxed) {
+            warn!(
+                "route {}: looking at the directory took {took:.0?}, and it is done every \
+                 {every:?}: raise PINGENV_ROUTE_<NAME>_DIR_REFRESH, or hold fewer files in memory \
+                 (MEMORY_PATHS)",
+                self.route
+            );
+        } else if !slow {
+            self.slow.store(false, Ordering::Relaxed);
         }
     }
 
@@ -509,12 +593,11 @@ impl Site {
     }
 
     async fn find_on_disk(&self, key: &str) -> Option<Found> {
-        let path = tokio::fs::canonicalize(self.root.join(&key[1..]))
-            .await
-            .ok()?;
+        let root = self.root.read().unwrap().clone();
+        let path = tokio::fs::canonicalize(root.join(&key[1..])).await.ok()?;
         // A symlink may point anywhere; only follow it inside the root, and
         // never into something the request path itself could not name.
-        if !visible_below(&self.root, &path) {
+        if !visible_below(&root, &path) {
             return None;
         }
         let file = tokio::fs::File::open(&path).await.ok()?;
@@ -750,14 +833,14 @@ fn candidates(
     Ok(())
 }
 
-/// Keeps the files that sites hold in memory in line with their directories,
-/// each at its own pace.
+/// Keeps what sites serve in line with their directories, each at its own
+/// pace.
 pub struct Refresh {
     sites: Vec<Arc<Site>>,
 }
 
 impl Refresh {
-    /// `None` when no site holds anything that could change.
+    /// `None` when every site is a snapshot taken at startup.
     pub fn new(sites: &[Option<Arc<Site>>]) -> Option<Refresh> {
         let due = |site: &&Arc<Site>| site.refresh_every().is_some();
         let sites: Vec<_> = sites.iter().flatten().filter(due).cloned().collect();
@@ -774,12 +857,13 @@ impl BackgroundService for Refresh {
             };
             loop {
                 tokio::time::sleep(every).await;
-                let site = site.clone();
+                let (started, pass) = (Instant::now(), site.clone());
                 // Off the threads that serve requests: there are files to
                 // read and to compress.
-                let pass = tokio::task::spawn_blocking(move || site.refresh());
-                if let Err(e) = pass.await {
-                    warn!("a refresh of the files in memory did not finish: {e}");
+                let pass = tokio::task::spawn_blocking(move || pass.refresh());
+                match pass.await {
+                    Ok(()) => site.pace(started.elapsed(), every),
+                    Err(e) => warn!("a refresh of the files served did not finish: {e}"),
                 }
             }
         });
@@ -1268,7 +1352,7 @@ mod tests {
             root: root.to_path_buf(),
             memory_max_file: max_file,
             memory_paths: paths.iter().map(|p| p.to_string()).collect(),
-            memory_refresh: refresh,
+            dir_refresh: refresh,
             fallback: None,
             cache_control: "no-cache".into(),
             immutable: Vec::new(),
@@ -1482,8 +1566,183 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// What a deploy tool does to say which build is live: a new link under
+    /// another name, renamed over the old one.
+    fn point(link: &Path, target: &str) {
+        let tmp = link.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(target, &tmp).unwrap();
+        std::fs::rename(&tmp, link).unwrap();
+    }
+
+    /// A site root holding two builds and a `current` link to the first.
+    fn two_releases(name: &str) -> PathBuf {
+        let dir = temp_site(name);
+        for (release, page, bundle) in [
+            ("1", "page one", "chunk-ONE.js"),
+            ("2", "page two", "chunk-TWO.js"),
+        ] {
+            let release = dir.join("releases").join(release);
+            std::fs::create_dir_all(&release).unwrap();
+            std::fs::write(release.join("index.html"), page).unwrap();
+            std::fs::write(release.join(bundle), format!("// {bundle}")).unwrap();
+        }
+        point(&dir.join("current"), "releases/1");
+        dir
+    }
+
+    fn on_disk(site: &Site, key: &str) -> Option<String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            match site.find_on_disk(key).await? {
+                Found::Disk(mut file, _) => {
+                    let mut text = String::new();
+                    file.read_to_string(&mut text).await.unwrap();
+                    Some(text)
+                }
+                Found::Memory(_) => unreachable!(),
+            }
+        })
+    }
+
     #[test]
-    fn what_is_held_is_refreshed_only_where_it_can_change() {
+    fn a_root_that_is_a_link_is_followed_when_it_moves() {
+        let dir = two_releases("link");
+        let config = static_site(
+            &dir.join("current"),
+            1000,
+            &[""],
+            Some(Duration::from_secs(5)),
+        );
+        let budget = MemoryBudget::new(1 << 20);
+        let site = Site::load("t", &config, budget.clone()).unwrap();
+        let used = || budget.used.load(Ordering::Relaxed);
+        assert_eq!(keys(&site), ["/chunk-ONE.js", "/index.html"]);
+        assert_eq!(used(), 8 + 15);
+
+        // The link moves. Until the next refresh nothing does here: memory
+        // and disk both still answer from the first build.
+        point(&dir.join("current"), "releases/2");
+        assert_eq!(held(&site, "/index.html").as_deref(), Some("page one"));
+        assert_eq!(
+            on_disk(&site, "/chunk-ONE.js").as_deref(),
+            Some("// chunk-ONE.js")
+        );
+        assert_eq!(on_disk(&site, "/chunk-TWO.js"), None);
+
+        // Then both move together, and what was held of the first is given back.
+        site.refresh();
+        assert_eq!(keys(&site), ["/chunk-TWO.js", "/index.html"]);
+        assert_eq!(held(&site, "/index.html").as_deref(), Some("page two"));
+        assert_eq!(
+            on_disk(&site, "/chunk-TWO.js").as_deref(),
+            Some("// chunk-TWO.js")
+        );
+        assert_eq!(on_disk(&site, "/chunk-ONE.js"), None);
+        assert_eq!(used(), 8 + 15);
+
+        // The first build can go now: nothing here still looks at it.
+        std::fs::remove_dir_all(dir.join("releases/1")).unwrap();
+        site.refresh();
+        assert_eq!(held(&site, "/index.html").as_deref(), Some("page two"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_is_followed_for_files_that_are_only_ever_read_from_disk() {
+        let dir = two_releases("link-disk");
+        let config = static_site(&dir.join("current"), 0, &[""], Some(Duration::from_secs(5)));
+        let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+        assert_eq!(on_disk(&site, "/index.html").as_deref(), Some("page one"));
+
+        point(&dir.join("current"), "releases/2");
+        assert_eq!(on_disk(&site, "/index.html").as_deref(), Some("page one"));
+        site.refresh();
+        assert_eq!(on_disk(&site, "/index.html").as_deref(), Some("page two"));
+        assert_eq!(keys(&site), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_that_leads_nowhere_changes_nothing() {
+        let dir = two_releases("link-broken");
+        let config = static_site(
+            &dir.join("current"),
+            1000,
+            &[""],
+            Some(Duration::from_secs(5)),
+        );
+        let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+
+        // To a build that is not there, then to a file: neither is a place
+        // to serve from, and the first build still is.
+        for nowhere in ["releases/3", "releases/2/index.html"] {
+            point(&dir.join("current"), nowhere);
+            site.refresh();
+            assert_eq!(held(&site, "/index.html").as_deref(), Some("page one"));
+            assert_eq!(
+                on_disk(&site, "/chunk-ONE.js").as_deref(),
+                Some("// chunk-ONE.js")
+            );
+            assert!(site.trouble.lock().unwrap().is_some());
+        }
+
+        // Put right, it is followed again, and there is nothing left to say.
+        point(&dir.join("current"), "releases/2");
+        site.refresh();
+        assert_eq!(held(&site, "/index.html").as_deref(), Some("page two"));
+        assert!(site.trouble.lock().unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_of_the_same_name_size_and_date_in_another_build_are_other_files() {
+        let dir = two_releases("link-same");
+        // Same length as in the first build, and the same date to the second.
+        let (one, two) = (
+            dir.join("releases/1/index.html"),
+            dir.join("releases/2/index.html"),
+        );
+        std::fs::write(&two, "page TWO").unwrap();
+        let date = std::fs::metadata(&one).unwrap().modified().unwrap();
+        let file = std::fs::File::options().write(true).open(&two).unwrap();
+        file.set_modified(date).unwrap();
+
+        let config = static_site(
+            &dir.join("current"),
+            1000,
+            &[""],
+            Some(Duration::from_secs(5)),
+        );
+        let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+        point(&dir.join("current"), "releases/2");
+        site.refresh();
+        assert_eq!(held(&site, "/index.html").as_deref(), Some("page TWO"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_slow_refresh_is_reported_once_and_again_only_after_a_quick_one() {
+        let dir = temp_site("pace");
+        let config = static_site(&dir, 0, &[""], Some(Duration::from_secs(5)));
+        let site = Site::load("t", &config, MemoryBudget::new(1 << 20)).unwrap();
+        let (every, slow) = (Duration::from_secs(5), |site: &Site| {
+            site.slow.load(Ordering::Relaxed)
+        });
+        site.pace(Duration::from_millis(100), every);
+        assert!(!slow(&site));
+        // More than a twentieth of the time between two refreshes.
+        site.pace(Duration::from_millis(300), every);
+        assert!(slow(&site));
+        site.pace(Duration::from_millis(10), every);
+        assert!(!slow(&site));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_site_is_looked_at_again_unless_it_is_a_snapshot() {
         let dir = temp_site("refresh-every");
         let every = |max_file, refresh| {
             let config = static_site(&dir, max_file, &[""], refresh);
@@ -1492,9 +1751,9 @@ mod tests {
         };
         let window = Some(Duration::from_secs(10));
         assert_eq!(every(1000, window), window);
-        // Nothing is held: nothing to keep up to date.
-        assert_eq!(every(0, window), None);
-        // PINGENV_ROUTE_<NAME>_MEMORY_REFRESH=0: a snapshot taken at startup.
+        // Nothing is held, but where the root leads may still change.
+        assert_eq!(every(0, window), window);
+        // PINGENV_ROUTE_<NAME>_DIR_REFRESH=0: what was there at startup.
         assert_eq!(every(1000, None), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }

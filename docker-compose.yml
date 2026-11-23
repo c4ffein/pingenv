@@ -18,9 +18,9 @@ services:
 
       # Files served by pingenv itself, straight from the bind mount, so edits
       # show up at once. Add PINGENV_ROUTE_SITE_MEMORY_MAX_FILE=1MiB to hold
-      # small files in memory instead (re-checked every five minutes), with a
-      # gzip copy of the ones that shrink. Either way, a .br or .gz file next
-      # to a file is sent in its place to clients that can read it.
+      # small files in memory instead (kept up to date every five seconds),
+      # with a gzip copy of the ones that shrink. Either way, a .br or .gz
+      # file next to a file is sent in its place to clients that can read it.
       PINGENV_ROUTE_SITE_HOST: example.com,www.example.com
       PINGENV_ROUTE_SITE_ROOT: /srv/site
 
