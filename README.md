@@ -92,12 +92,50 @@ outside `MEMORY_PATHS`, added since the last pass, or more than
 `MEMORY_REFRESH=0` for a frozen snapshot, which suits a site baked into an
 image.
 
-Memory follows the directory; it cannot make a deploy atomic. While files are
-being copied in, a request may find a new page with old scripts, or a file
-half written, and with `IMMUTABLE` a browser keeps what it got. Copy in a way
-that puts whole files in place at the end: `rsync -a --delay-updates
---delete-delay` does, and its temporary files are hidden ones, which are never
-served.
+**Deploying.** pingenv serves a file from the moment it has its name in the
+directory, and may read it into memory right then. That the file is whole at
+that moment is up to whoever puts it there: a file copied straight to its
+final name is there half written for as long as the copy takes, and a request
+or a refresh that comes by gets the half. So copy to somewhere else on the
+same filesystem first, then rename into place, which is atomic. A hidden
+directory inside the root does well as "somewhere else": nothing hidden is
+ever served, or held in memory.
+
+A whole build can take the place of another in one step, by exchanging the two
+directories (GNU coreutils 9.5 or later):
+
+```sh
+scp -r dist box:/srv/www/site.new
+ssh box 'mv --exchange -T /srv/www/site.new /srv/www/site && rm -r /srv/www/site.new'
+```
+
+pingenv has to be able to see the exchange: a container that mounts
+`/srv/www/site` keeps the directory it was started with, whatever that is
+called afterwards, so mount `/srv/www` and point `ROOT` at the directory
+inside it. And the old build is gone from that moment, which is what a
+single-page application does not want: a page loaded a second earlier, or an
+hour, still asks for the scripts it came with.
+
+For a single-page application, whose bundles carry a hash of their content in
+their names, the better pattern keeps both builds side by side for a while:
+
+1. **Copy the build into a hidden directory** inside the root.
+2. **Rename the new bundles into place.** Their names are new, so no page
+   refers to them yet.
+3. **Rename the new page into place, last.** From then on a request gets the
+   new build. Any other file that keeps its name goes the same way.
+4. **Delete the bundles of the previous build some time later:** when the
+   pages that were open have had time to be reloaded, or at the next deploy.
+
+```sh
+scp -r dist box:/srv/www/site/.incoming
+ssh box 'cd /srv/www/site && mv .incoming/*.js .incoming/*.css . &&
+         mv .incoming/* . && rmdir .incoming'
+```
+
+Either way, what is held in memory follows at the next `MEMORY_REFRESH` pass,
+the page and its bundles in the same step: the old page with the old bundles
+until then, the new page with the new ones after.
 
 **Compression happens once per file, never once per request.** Text (HTML,
 CSS, JavaScript, JSON, SVG, WebAssembly and the like) is sent compressed to
