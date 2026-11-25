@@ -124,6 +124,9 @@ echo 'console.log("bundle")' >"$SITE/main-4f9a1c.js"
 echo 'here at startup, deleted later' >"$SITE/doomed.txt"
 python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))' <"$SITE/pre.js" >"$SITE/pre.js.gz"
 printf 'brotli-stand-in' >"$SITE/pre.js.br"
+# The page a site generator makes for what is not found: long enough to shrink.
+{ echo '<h1>nothing here</h1>'; for _ in $(seq 200); do echo '<p>the menu, the footer, a way back home</p>'; done; } >"$SITE/404.html"
+LOST_SUM="$(sha256sum <"$SITE/404.html")"
 
 # A site kept as one directory per build, with a link to the one that is live.
 # Each has a page small enough for memory and a file that is not.
@@ -133,6 +136,8 @@ for n in one two; do
     echo "<h1>$n</h1>" >"$RELROOT/releases/$n/index.html"
     { echo "large $n"; head -c 100000 /dev/zero; } >"$RELROOT/releases/$n/large.txt"
 done
+# Only the first build has a page for what is not found.
+echo '<h1>lost in one</h1>' >"$RELROOT/releases/one/404.html"
 ln -s releases/one "$RELROOT/current"
 
 # A certificate for a host that two routes share, named on only one of them.
@@ -149,12 +154,13 @@ env -i \
     PINGENV_ROUTE_LB_HOST=lb.pingenv.test PINGENV_ROUTE_LB_UPSTREAM=127.0.0.1:18001,127.0.0.1:18009,127.0.0.1:18002 \
     PINGENV_ROUTE_SITE_HOST=site.pingenv.test PINGENV_ROUTE_SITE_ROOT="$SITE" \
     PINGENV_ROUTE_SITE_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_SITE_FALLBACK=/index.html \
+    PINGENV_ROUTE_SITE_NOT_FOUND=/404.html \
     PINGENV_ROUTE_SITE_DIR_REFRESH=1h \
     PINGENV_ROUTE_SITE_IMMUTABLE='/main-*.js' \
     PINGENV_ROUTE_ASSETS_HOST=app.pingenv.test PINGENV_ROUTE_ASSETS_PATH=/static \
     PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
     PINGENV_ROUTE_LIVE_HOST=live.pingenv.test PINGENV_ROUTE_LIVE_ROOT="$SITE" \
-    PINGENV_ROUTE_LIVE_MEMORY_MAX_FILE=0 \
+    PINGENV_ROUTE_LIVE_MEMORY_MAX_FILE=0 PINGENV_ROUTE_LIVE_NOT_FOUND=/404.html \
     PINGENV_ROUTE_WS_HOST=ws.pingenv.test PINGENV_ROUTE_WS_UPSTREAM=127.0.0.1:18003 \
     PINGENV_ROUTE_PT_HOST=pt.pingenv.test PINGENV_ROUTE_PT_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_PT_ACME_PASSTHROUGH=true \
     PINGENV_ROUTE_SLOW_HOST=slow.pingenv.test PINGENV_ROUTE_SLOW_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_SLOW_READ_TIMEOUT=10s \
@@ -177,6 +183,7 @@ env -i \
     PINGENV_ROUTE_TICK_HOST=tick.pingenv.test PINGENV_ROUTE_TICK_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_TICK_RATE_LIMIT=1/s \
     PINGENV_ROUTE_REL_HOST=rel.pingenv.test PINGENV_ROUTE_REL_ROOT="$RELROOT/current" \
     PINGENV_ROUTE_REL_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_REL_DIR_REFRESH=1s \
+    PINGENV_ROUTE_REL_NOT_FOUND=/404.html \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -341,8 +348,28 @@ check "the fallback page is checked each time, whatever the path looks like" \
 check "no fallback for missing assets" "$(code "$S/missing.js")" 404
 check "POST is refused" "$(code -X POST "$S/")" 405
 
-echo "== compression"
+echo "== the site's own page for what is not found"
 L="https://live.pingenv.test:$HTTPS"
+A="https://app.pingenv.test:$HTTPS/static"
+check "a path that leads nowhere gets the page, with a 404" \
+    "$(code "$L/nowhere/at/all") $(get -k "$L/nowhere/at/all" | sha256sum) $(src 'live.pingenv.test/nowhere/at/all')" "404 $LOST_SUM upstream=disk"
+check "as the page it is, and not to be kept" \
+    "$(hdr content-type "$L/nowhere") / $(hdr cache-control "$L/nowhere")" 'text/html; charset=utf-8 / no-cache'
+check "a range or a tag in the request changes nothing: all of it, with a 404" \
+    "$(code -r 0-9 "$L/nowhere") $(get -k -r 0-9 "$L/nowhere" | sha256sum) $(code -H 'If-None-Match: *' "$L/nowhere")" "404 $LOST_SUM 404"
+check "and the answer offers neither" "$(hdr etag "$L/nowhere")|$(hdr last-modified "$L/nowhere")|$(hdr accept-ranges "$L/nowhere")" "||"
+check "HEAD gets its length and no body" \
+    "$(get -k -I -o /dev/null -w '%{http_code} %{size_download}' "$L/nowhere") $(hdr content-length -I "$L/nowhere")" "404 0 $(wc -c <"$SITE/404.html")"
+check "what a path may not name gets it too" \
+    "$(get -k --path-as-is "$L/css/../../outside.txt" | sha256sum) $(get -k "$L/.env" | sha256sum)" "$LOST_SUM $LOST_SUM"
+check "held in memory, it is sent compressed like any page" \
+    "$(code -H 'Accept-Encoding: gzip' "$S/missing.js") $(hdr content-encoding -H 'Accept-Encoding: gzip' "$S/missing.js") $(get -k --compressed "$S/missing.js" | sha256sum) $(src 'site.pingenv.test/missing.js')" \
+    "404 gzip $LOST_SUM upstream=memory"
+check "the fallback still answers the paths it is for" "$(code "$S/users/42") $(get -k "$S/users/42")" '200 <h1>home</h1>'
+check "asked for by its name, it is a page like another" "$(code "$L/404.html")" 200
+check "a route that names no page answers with a line of text" "$(code "$A/nowhere.txt") $(get -k "$A/nowhere.txt")" '404 not found'
+
+echo "== compression"
 size() { get -k -o /dev/null -w '%{size_download}' "$@"; }
 PLAIN_SIZE="$(size "$S/auto.js")"
 check "a file held in memory is sent gzipped to a client that asks" \
@@ -376,7 +403,6 @@ check "a range is a range of what is sent" \
 check "HEAD reports the compressed length" \
     "$(get -k -I -H 'Accept-Encoding: br' "$L/pre.js" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-length"{print $2}')" 15
 
-A="https://app.pingenv.test:$HTTPS/static"
 check "files under a path prefix" "$(get -k "$A/css/site.css")" 'body{}'
 check "prefix root serves the index" "$(get -k "$A/")" '<h1>home</h1>'
 check "prefix without slash redirects" \
@@ -417,12 +443,14 @@ REL="https://rel.pingenv.test:$HTTPS"
 check "the build the link leads to is served, from memory and from disk" \
     "$(get -k "$REL/") $(get -k -r 0-8 "$REL/large.txt") $(src 'rel.pingenv.test/') $(src 'rel.pingenv.test/large.txt')" \
     '<h1>one</h1> large one upstream=memory upstream=disk'
+check "the page for what is not found is the build's" "$(code "$REL/lost") $(get -k "$REL/lost")" '404 <h1>lost in one</h1>'
 # What a deploy does to switch: a new link under another name, renamed over
 # the old one.
 ln -sfn releases/two "$RELROOT/.current" && mv -T "$RELROOT/.current" "$RELROOT/current"
 sleep 2.5
 check "when the link moves, a refresh follows it, for both" \
     "$(get -k "$REL/") $(get -k -r 0-8 "$REL/large.txt")" '<h1>two</h1> large two'
+check "a build without the page answers with a line of text" "$(code "$REL/lost") $(get -k "$REL/lost")" '404 not found'
 rm -rf "$RELROOT/releases/one"
 sleep 1.5
 check "and the build it left can be deleted" "$(get -k "$REL/") $(code "$REL/large.txt")" '<h1>two</h1> 200'

@@ -1077,8 +1077,7 @@ pub async fn serve(
         &path[prefix.len()..]
     };
     let Some((segments, trailing_slash)) = clean_path(below_prefix) else {
-        respond(session, 404, &[], "not found\n", hsts).await?;
-        return Ok("-");
+        return not_found(site, session, head, hsts).await;
     };
 
     let found = match site.lookup(&segments, trailing_slash).await {
@@ -1099,8 +1098,7 @@ pub async fn serve(
         },
     };
     let Some((key, found)) = found else {
-        respond(session, 404, &[], "not found\n", hsts).await?;
-        return Ok("-");
+        return not_found(site, session, head, hsts).await;
     };
 
     let meta = found.meta();
@@ -1194,6 +1192,13 @@ pub async fn serve(
         return Ok(source);
     }
 
+    send(session, body, start, end).await?;
+    Ok(source)
+}
+
+/// Sends the bytes from `start` up to `end` of a body whose headers are
+/// written. There is at least one.
+async fn send(session: &mut Session, body: Body, start: u64, end: u64) -> Result<()> {
     match body {
         Body::Memory(bytes) => {
             let body = bytes.slice(start as usize..end as usize);
@@ -1221,6 +1226,68 @@ pub async fn serve(
                     .await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// What is sent with the page for what is not found. A path that leads
+/// nowhere now may lead to a page after the next deploy, so nobody is to
+/// keep this answer: not for the route's `CACHE_CONTROL`, and not for the year
+/// an `IMMUTABLE` pattern that fits the page's own name would give it.
+const NOT_FOUND_CACHE_CONTROL: &str = "no-cache";
+
+/// The 404 of a route that serves files: the site's own page if the route
+/// names one and it is there, a line of text otherwise.
+///
+/// The page is sent whole and without validators. `If-None-Match` and
+/// `Range` are about the file that was asked for, and this is not it: a
+/// 304 or a 206 here would tell the client that it exists.
+async fn not_found(
+    site: &Site,
+    session: &mut Session,
+    head: bool,
+    hsts: Option<&str>,
+) -> Result<&'static str> {
+    let page = match &site.config.not_found {
+        Some(key) => site.find(key).await.map(|found| (key, found)),
+        None => None,
+    };
+    let Some((key, found)) = page else {
+        respond(session, 404, &[], "not found\n", hsts).await?;
+        return Ok("-");
+    };
+
+    let meta = found.meta();
+    let varies = site.negotiable(&meta);
+    let accepts = Accepts::parse(header(session, http::header::ACCEPT_ENCODING).as_deref());
+    let Representation {
+        body, len, coding, ..
+    } = site.represent(key, found, accepts).await;
+    let source = match body {
+        Body::Memory(_) => "memory",
+        Body::Disk(_) => "disk",
+    };
+
+    let mut resp = ResponseHeader::build(404, Some(7))?;
+    resp.insert_header("Content-Type", meta.content_type)?;
+    resp.insert_header("Content-Length", len.to_string())?;
+    resp.insert_header("Cache-Control", NOT_FOUND_CACHE_CONTROL)?;
+    if let Some(coding) = coding {
+        resp.insert_header("Content-Encoding", coding.token())?;
+    }
+    if varies {
+        resp.insert_header("Vary", "Accept-Encoding")?;
+    }
+    resp.insert_header("X-Content-Type-Options", "nosniff")?;
+    if let Some(value) = hsts {
+        resp.insert_header("Strict-Transport-Security", value)?;
+    }
+    let no_body = head || len == 0;
+    session
+        .write_response_header(Box::new(resp), no_body)
+        .await?;
+    if !no_body {
+        send(session, body, 0, len).await?;
     }
     Ok(source)
 }
@@ -1354,6 +1421,7 @@ mod tests {
             memory_paths: paths.iter().map(|p| p.to_string()).collect(),
             dir_refresh: refresh,
             fallback: None,
+            not_found: None,
             cache_control: "no-cache".into(),
             immutable: Vec::new(),
             compress: true,

@@ -65,6 +65,9 @@ pub struct StaticSite {
     pub dir_refresh: Option<Duration>,
     /// Served for paths that match no file, for single-page applications.
     pub fallback: Option<String>,
+    /// The site's own page for what is not found, sent with the 404 in
+    /// place of a line of text.
+    pub not_found: Option<String>,
     pub cache_control: String,
     /// Patterns (`*` stands for any run of characters) for files whose
     /// content never changes under the same name, like a build's hashed
@@ -232,6 +235,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "SET_HOST",
     "UPSTREAM",
     "FALLBACK",
+    "NOT_FOUND",
     "HOST",
     "PATH",
     "ROOT",
@@ -871,10 +875,13 @@ fn parse_route(
                 }
             }
             let fallback = field("FALLBACK").cloned();
-            if let Some(f) = &fallback
-                && !f.starts_with('/')
-            {
-                errors.push(format!("{}: '{f}' must start with /", var("FALLBACK")));
+            let not_found = field("NOT_FOUND").cloned();
+            for (name, file) in [("FALLBACK", &fallback), ("NOT_FOUND", &not_found)] {
+                if let Some(f) = file
+                    && !f.starts_with('/')
+                {
+                    errors.push(format!("{}: '{f}' must start with /", var(name)));
+                }
             }
             let memory_max_file = match field("MEMORY_MAX_FILE") {
                 None => DEFAULT_MEMORY_MAX_FILE,
@@ -949,6 +956,7 @@ fn parse_route(
                 memory_paths,
                 dir_refresh,
                 fallback,
+                not_found,
                 cache_control,
                 immutable,
                 compress,
@@ -957,6 +965,7 @@ fn parse_route(
         None => {
             for files_only in [
                 "FALLBACK",
+                "NOT_FOUND",
                 "MEMORY_MAX_FILE",
                 "MEMORY_PATHS",
                 "DIR_REFRESH",
@@ -1511,6 +1520,7 @@ mod tests {
             ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
             ("PINGENV_ROUTE_SITE_MEMORY_MAX_FILE", "64KiB"),
             ("PINGENV_ROUTE_SITE_FALLBACK", "/index.html"),
+            ("PINGENV_ROUTE_SITE_NOT_FOUND", "/404.html"),
             ("PINGENV_MEMORY_MAX_TOTAL", "10MB"),
         ])
         .unwrap();
@@ -1524,6 +1534,7 @@ mod tests {
                 memory_paths: vec![String::new()],
                 dir_refresh: Some(Duration::from_secs(5)),
                 fallback: Some("/index.html".into()),
+                not_found: Some("/404.html".into()),
                 cache_control: "no-cache".into(),
                 immutable: Vec::new(),
                 compress: true,
@@ -1702,6 +1713,26 @@ mod tests {
             errs.contains("PINGENV_IDLE_TIMEOUT: 'soon' is not a duration"),
             "{errs}"
         );
+    }
+
+    #[test]
+    fn a_page_for_what_is_not_found_goes_with_a_directory() {
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_ROOT", "/srv/a"),
+            ("PINGENV_ROUTE_A_NOT_FOUND", "404.html"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_NOT_FOUND", "/404.html"),
+        ])
+        .unwrap_err()
+        .join("\n");
+        for expected in [
+            "PINGENV_ROUTE_A_NOT_FOUND: '404.html' must start with /",
+            "PINGENV_ROUTE_B_NOT_FOUND: only applies to routes with a PINGENV_ROUTE_B_ROOT",
+        ] {
+            assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
+        }
     }
 
     #[test]
