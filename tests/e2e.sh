@@ -161,6 +161,7 @@ env -i \
     PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
     PINGENV_ROUTE_LIVE_HOST=live.pingenv.test PINGENV_ROUTE_LIVE_ROOT="$SITE" \
     PINGENV_ROUTE_LIVE_MEMORY_MAX_FILE=0 PINGENV_ROUTE_LIVE_NOT_FOUND=/404.html \
+    PINGENV_ROUTE_LIVE_ALLOW_ORIGIN='*' \
     PINGENV_ROUTE_WS_HOST=ws.pingenv.test PINGENV_ROUTE_WS_UPSTREAM=127.0.0.1:18003 \
     PINGENV_ROUTE_PT_HOST=pt.pingenv.test PINGENV_ROUTE_PT_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_PT_ACME_PASSTHROUGH=true \
     PINGENV_ROUTE_SLOW_HOST=slow.pingenv.test PINGENV_ROUTE_SLOW_UPSTREAM=127.0.0.1:18001 PINGENV_ROUTE_SLOW_READ_TIMEOUT=10s \
@@ -368,6 +369,20 @@ check "held in memory, it is sent compressed like any page" \
 check "the fallback still answers the paths it is for" "$(code "$S/users/42") $(get -k "$S/users/42")" '200 <h1>home</h1>'
 check "asked for by its name, it is a page like another" "$(code "$L/404.html")" 200
 check "a route that names no page answers with a line of text" "$(code "$A/nowhere.txt") $(get -k "$A/nowhere.txt")" '404 not found'
+
+echo "== files that pages of another origin may read"
+ACAO=access-control-allow-origin
+check "a file says who may read it" "$(code "$L/css/site.css") $(hdr $ACAO "$L/css/site.css")" '200 *'
+check "and so does a part of one" "$(code -r 0-9 "$L/big.bin") $(hdr $ACAO -r 0-9 "$L/big.bin")" '206 *'
+LIVE_TAG="$(hdr etag "$L/css/site.css")"
+check "and the word that a copy is still good" \
+    "$(code -H "If-None-Match: $LIVE_TAG" "$L/css/site.css") $(hdr $ACAO -H "If-None-Match: $LIVE_TAG" "$L/css/site.css")" '304 *'
+check "and the answer to a HEAD" "$(hdr $ACAO -I "$L/css/site.css")" '*'
+check "the page for what is not found does not" \
+    "$(code "$L/nowhere")|$(hdr $ACAO "$L/nowhere")|$(hdr content-type "$L/nowhere")" '404||text/html; charset=utf-8'
+check "nor does a refusal, a redirect or a range that cannot be met" \
+    "$(hdr $ACAO -X POST "$L/")|$(hdr $ACAO "$L/docs")|$(hdr $ACAO -r 999999- "$L/big.bin")" '||'
+check "a route that names no origin sends none" "$(code "$S/css/site.css")|$(hdr $ACAO "$S/css/site.css")" '200|'
 
 echo "== compression"
 size() { get -k -o /dev/null -w '%{size_download}' "$@"; }

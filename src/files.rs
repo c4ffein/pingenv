@@ -1127,6 +1127,13 @@ pub async fn serve(
             // another client may be owed a different one.
             resp.insert_header("Vary", "Accept-Encoding")?;
         }
+        // The same for every request, whoever asks: nothing varies with it.
+        // It goes with a file, a part of one, or the word that the copy the
+        // browser holds is still good, and with no other answer: an error
+        // is not something a page elsewhere was let in to read.
+        if let Some(origin) = &site.config.allow_origin {
+            resp.insert_header("Access-Control-Allow-Origin", origin)?;
+        }
         if let Some(value) = hsts {
             resp.insert_header("Strict-Transport-Security", value)?;
         }
@@ -1422,6 +1429,7 @@ mod tests {
             dir_refresh: refresh,
             fallback: None,
             not_found: None,
+            allow_origin: None,
             cache_control: "no-cache".into(),
             immutable: Vec::new(),
             compress: true,

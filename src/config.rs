@@ -68,6 +68,9 @@ pub struct StaticSite {
     /// The site's own page for what is not found, sent with the 404 in
     /// place of a line of text.
     pub not_found: Option<String>,
+    /// Sent as `Access-Control-Allow-Origin` with every file: `*`, or the
+    /// one origin whose pages may read these files from a browser.
+    pub allow_origin: Option<String>,
     pub cache_control: String,
     /// Patterns (`*` stands for any run of characters) for files whose
     /// content never changes under the same name, like a build's hashed
@@ -236,6 +239,7 @@ const ROUTE_FIELDS: &[&str] = &[
     "UPSTREAM",
     "FALLBACK",
     "NOT_FOUND",
+    "ALLOW_ORIGIN",
     "HOST",
     "PATH",
     "ROOT",
@@ -883,6 +887,12 @@ fn parse_route(
                     errors.push(format!("{}: '{f}' must start with /", var(name)));
                 }
             }
+            let allow_origin = field("ALLOW_ORIGIN").cloned();
+            if let Some(origin) = &allow_origin
+                && let Err(why) = validate_origin(origin)
+            {
+                errors.push(format!("{}: '{origin}' {why}", var("ALLOW_ORIGIN")));
+            }
             let memory_max_file = match field("MEMORY_MAX_FILE") {
                 None => DEFAULT_MEMORY_MAX_FILE,
                 Some(v) => parse_size(v).unwrap_or_else(|why| {
@@ -957,6 +967,7 @@ fn parse_route(
                 dir_refresh,
                 fallback,
                 not_found,
+                allow_origin,
                 cache_control,
                 immutable,
                 compress,
@@ -966,6 +977,7 @@ fn parse_route(
             for files_only in [
                 "FALLBACK",
                 "NOT_FOUND",
+                "ALLOW_ORIGIN",
                 "MEMORY_MAX_FILE",
                 "MEMORY_PATHS",
                 "DIR_REFRESH",
@@ -1076,6 +1088,42 @@ fn validate_redirect(to: &str, keep_path: bool) -> Result<(), &'static str> {
     }
     if keep_path && (to.contains('?') || to.contains('#')) {
         return Err("cannot have a query or a fragment when the request's path is kept");
+    }
+    Ok(())
+}
+
+/// What `ALLOW_ORIGIN` may be: `*`, or one origin written the way a browser
+/// writes its own in the `Origin` header, since the browser compares the
+/// two as they are. That is a scheme, a host and a port if it has one, and
+/// nothing after: with a path, or a second origin, it matches no page.
+fn validate_origin(origin: &str) -> Result<(), &'static str> {
+    if origin == "*" {
+        return Ok(());
+    }
+    if origin.contains(',') || !origin.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("is not one origin (no spaces, no commas: the header takes a single one)");
+    }
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .ok_or("must be * or one origin, like https://example.com")?;
+    if rest.contains(['/', '?', '#']) {
+        return Err(
+            "is more than an origin: nothing comes after the host and its port, not even a /",
+        );
+    }
+    // Written back from its parts, an authority that is only a host and a
+    // port comes out as it went in. One with a user, an empty port or a port
+    // that is not one does not.
+    let plain = rest.parse::<http::uri::Authority>().ok().and_then(|a| {
+        let host = a.host();
+        (!host.is_empty()).then(|| match a.port_u16() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        })
+    });
+    if plain.as_deref() != Some(rest) {
+        return Err("is not an origin (https://host, or https://host:port)");
     }
     Ok(())
 }
@@ -1521,6 +1569,7 @@ mod tests {
             ("PINGENV_ROUTE_SITE_MEMORY_MAX_FILE", "64KiB"),
             ("PINGENV_ROUTE_SITE_FALLBACK", "/index.html"),
             ("PINGENV_ROUTE_SITE_NOT_FOUND", "/404.html"),
+            ("PINGENV_ROUTE_SITE_ALLOW_ORIGIN", "*"),
             ("PINGENV_MEMORY_MAX_TOTAL", "10MB"),
         ])
         .unwrap();
@@ -1535,6 +1584,7 @@ mod tests {
                 dir_refresh: Some(Duration::from_secs(5)),
                 fallback: Some("/index.html".into()),
                 not_found: Some("/404.html".into()),
+                allow_origin: Some("*".into()),
                 cache_control: "no-cache".into(),
                 immutable: Vec::new(),
                 compress: true,
@@ -1730,6 +1780,82 @@ mod tests {
         for expected in [
             "PINGENV_ROUTE_A_NOT_FOUND: '404.html' must start with /",
             "PINGENV_ROUTE_B_NOT_FOUND: only applies to routes with a PINGENV_ROUTE_B_ROOT",
+        ] {
+            assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
+        }
+    }
+
+    #[test]
+    fn files_are_opened_to_every_origin_or_to_one() {
+        let with = |value: &str| {
+            env(&[
+                ("PINGENV_ROUTE_A_HOST", "a.test"),
+                ("PINGENV_ROUTE_A_ROOT", "/srv/a"),
+                ("PINGENV_ROUTE_A_ALLOW_ORIGIN", value),
+            ])
+        };
+        for origin in [
+            "*",
+            "https://app.example",
+            "http://localhost:5173",
+            "https://[::1]:8443",
+            "http://[::1]",
+        ] {
+            let cfg = with(origin).unwrap();
+            let site = cfg.routes[0].site.as_ref().unwrap();
+            assert_eq!(site.allow_origin.as_deref(), Some(origin));
+        }
+        // Unset, nothing is sent: the files are the site's own.
+        let cfg = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_ROOT", "/srv/a"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.routes[0].site.as_ref().unwrap().allow_origin, None);
+
+        const NOT_ONE: &str = "is not one origin";
+        const NO_SCHEME: &str = "must be * or one origin, like https://example.com";
+        const MORE: &str = "is more than an origin";
+        const NOT_AN_ORIGIN: &str = "is not an origin (https://host, or https://host:port)";
+        for (value, why) in [
+            // A browser takes one value here, and compares it as it is.
+            ("https://a.example, https://b.example", NOT_ONE),
+            ("https://a.example,https://b.example", NOT_ONE),
+            ("https://a .example", NOT_ONE),
+            ("app.example", NO_SCHEME),
+            ("//app.example", NO_SCHEME),
+            ("null", NO_SCHEME),
+            ("**", NO_SCHEME),
+            ("https://app.example/", MORE),
+            ("https://app.example/page", MORE),
+            ("https://app.example?x=1", MORE),
+            ("https://app.example#top", MORE),
+            ("https://", NOT_AN_ORIGIN),
+            ("https://:8443", NOT_AN_ORIGIN),
+            ("https://app.example:", NOT_AN_ORIGIN),
+            ("https://app.example:port", NOT_AN_ORIGIN),
+            ("https://app.example:99999", NOT_AN_ORIGIN),
+            ("https://user@app.example", NOT_AN_ORIGIN),
+        ] {
+            let errs = with(value).unwrap_err().join("\n");
+            let expected = format!("PINGENV_ROUTE_A_ALLOW_ORIGIN: '{value}' {why}");
+            assert!(errs.contains(&expected), "missing '{expected}' in:\n{errs}");
+        }
+
+        // What an upstream sends is the upstream's business.
+        let errs = env(&[
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_ALLOW_ORIGIN", "*"),
+            ("PINGENV_ROUTE_C_HOST", "c.test"),
+            ("PINGENV_ROUTE_C_REDIRECT", "https://c.example"),
+            ("PINGENV_ROUTE_C_ALLOW_ORIGIN", "*"),
+        ])
+        .unwrap_err()
+        .join("\n");
+        for expected in [
+            "PINGENV_ROUTE_B_ALLOW_ORIGIN: only applies to routes with a PINGENV_ROUTE_B_ROOT",
+            "PINGENV_ROUTE_C_ALLOW_ORIGIN: only applies to routes with a PINGENV_ROUTE_C_ROOT",
         ] {
             assert!(errs.contains(expected), "missing '{expected}' in:\n{errs}");
         }
